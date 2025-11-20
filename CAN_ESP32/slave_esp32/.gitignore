@@ -1,0 +1,15 @@
+# Carpetas de compilación (se generan solas al compilar)
+build/
+managed_components/
+dependencies.lock
+
+# Herramientas de Espressif (Esto es lo que te está dando el error)
+components/.espressif/
+.espressif/
+
+# Archivos de configuración del editor (opcional pero recomendado)
+.vscode/
+.idea/
+
+# Archivos de configuración locales (opcional)
+sdkconfig.old
