@@ -1,4 +1,4 @@
 idf_component_register(SRCS "main.c"
                     INCLUDE_DIRS "."
-                    REQUIRES canopennode esp_timer driver log freertos
+                    REQUIRES canopennode efuse esp_timer driver nvs_flash log freertos
                     )
