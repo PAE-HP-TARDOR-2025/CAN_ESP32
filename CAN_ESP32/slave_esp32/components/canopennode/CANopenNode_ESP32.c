@@ -1,6 +1,6 @@
 #include "sdkconfig.h"
 
-// --- PARCHE DE CONFIGURACIÓN (OBLIGATORIO) ---
+// --- PARCHE DE CONFIGURACIÓN (Valores por defecto si no están en menuconfig) ---
 #ifndef CONFIG_CO_MAIN_TASK_STACK_SIZE
 #define CONFIG_CO_MAIN_TASK_STACK_SIZE 4096
 #endif
@@ -46,8 +46,9 @@
 #include "CANopen.h"
 #include "OD.h"
 #include "driver/gpio.h" 
-#include "freertos/FreeRTOS.h" // Necesario para Semáforos
-#include "freertos/semphr.h"   // Necesario para Semáforos
+#include "freertos/FreeRTOS.h" 
+#include "freertos/semphr.h" 
+#include "driver/twai.h" // NECESARIO para el monitor de tráfico
 
 #if (CONFIG_FREERTOS_HZ != 1000)
 // #error "FreeRTOS tick interrupt frequency must be 1000Hz" 
@@ -56,13 +57,14 @@
 #define CO_PERIODIC_TASK_INTERVAL_US (CONFIG_CO_PERIODIC_TASK_INTERVAL_MS * 1000)
 #define CO_MAIN_TASK_INTERVAL_US (CONFIG_CO_MAIN_TASK_INTERVAL_MS * 1000)
 
-// PIN DE EMERGENCIA (BOOT BUTTON)
+// Configuración Hardware
 #define PIN_EMERGENCIA GPIO_NUM_0
-
 static const char *TAG = "CO_ESP32";
 
+// Configuración NMT básica
 #define NMT_CONTROL (CO_NMT_STARTUP_TO_OPERATIONAL | CO_NMT_ERR_ON_ERR_REG | CO_ERR_REG_GENERIC_ERR | CO_ERR_REG_COMMUNICATION)
 
+// Objetos Globales
 static CO_t *CO = NULL;
 static void *CANptr = NULL;
 
@@ -76,30 +78,26 @@ static StackType_t xCoPeriodicStack[CONFIG_CO_PERIODIC_TASK_STACK_SIZE];
 static TaskHandle_t xCoPeriodicTaskHandle = NULL;
 static void CO_periodicTask(void *pxParam);
 
-// Variables lógicas
+// Variables lógicas de aplicación
 bool b_emergencia_activa = false;
 uint8_t u8_dato_dummy = 0;
-
-// --- NUEVO: Semáforo para comunicar la interrupción con el bucle ---
 SemaphoreHandle_t xSemaforoEmergencia = NULL;
 
 // --------------------------------------------------------------------------
-// RUTINA DE INTERRUPCIÓN (ISR) - SE EJECUTA AL PULSAR EL BOTÓN
-// Debe ser IRAM_ATTR para estar en memoria RAM rápida
+// RUTINA DE INTERRUPCIÓN (ISR) - Botón
 // --------------------------------------------------------------------------
 static void IRAM_ATTR gpio_isr_handler(void* arg)
 {
-    // Solo "Damos" el semáforo. Es una operación segura y rapidísima.
-    // No enviamos el CAN aquí para no bloquear el sistema.
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     xSemaphoreGiveFromISR(xSemaforoEmergencia, &xHigherPriorityTaskWoken);
-    
-    // Si la tarea principal estaba esperando, forzamos que se ejecute ya
     if (xHigherPriorityTaskWoken) {
         portYIELD_FROM_ISR();
     }
 }
 
+// --------------------------------------------------------------------------
+// INICIALIZACIÓN
+// --------------------------------------------------------------------------
 bool CO_ESP32_init()
 {
     ESP_LOGI(TAG, "Initializing");
@@ -116,6 +114,9 @@ bool CO_ESP32_init()
     return (xCoMainTaskHandle != NULL);
 }
 
+// --------------------------------------------------------------------------
+// TAREA PRINCIPAL (MAIN TASK)
+// --------------------------------------------------------------------------
 static void CO_mainTask(void *pxParam)
 {
     CO_ReturnError_t err;
@@ -128,26 +129,18 @@ static void CO_mainTask(void *pxParam)
 
     ESP_LOGI(TAG, "main task running.");
 
-    // --- CONFIGURACIÓN DE INTERRUPCIÓN HARDWARE ---
-    // 1. Crear Semáforo Binario
+    // 1. Configuración de Interrupción (Botón)
     xSemaforoEmergencia = xSemaphoreCreateBinary();
-
-    // 2. Configurar GPIO
     gpio_config_t io_conf = {};
-    io_conf.intr_type = GPIO_INTR_NEGEDGE; // Interrupción por FLANCO DE BAJADA (al pulsar)
+    io_conf.intr_type = GPIO_INTR_NEGEDGE; 
     io_conf.pin_bit_mask = (1ULL << PIN_EMERGENCIA);
     io_conf.mode = GPIO_MODE_INPUT;
-    io_conf.pull_up_en = 1; // Pull-up interno
+    io_conf.pull_up_en = 1; 
     gpio_config(&io_conf);
-
-    // 3. Instalar el servicio de interrupciones y añadir el manejador
-    // El '0' significa flags por defecto
     gpio_install_isr_service(0);
     gpio_isr_handler_add(PIN_EMERGENCIA, gpio_isr_handler, (void*) PIN_EMERGENCIA);
     
-    ESP_LOGI(TAG, "Interrupción configurada en GPIO %d (Flanco de bajada)", PIN_EMERGENCIA);
-    // ------------------------------------------------
-
+    // 2. Inicialización de Memoria CANopen
     CO = CO_new(NULL, &heapMemoryUsed);
     if (CO == NULL) ESP_LOGW(TAG, "Can't allocate memory");
 
@@ -157,9 +150,20 @@ static void CO_mainTask(void *pxParam)
         CO->CANmodule->CANnormal = false;
         CO_CANsetConfigurationMode(CANptr);
 
+        // Inicializar Driver CAN
         err = CO_CANinit(CO, CANptr, CONFIG_CO_DEFAULT_BPS);
-        if (err != CO_ERROR_NO) ESP_LOGE(TAG, "CAN initialization failed: %d", err);
+        
+        // --- CORRECCIÓN: NO LLAMAR A CO_delete SI FALLA EL INIT ---
+        if (err != CO_ERROR_NO) 
+        {
+            ESP_LOGE(TAG, "CAN initialization failed: %d", err);
+            
+            vTaskDelete(NULL); // Simplemente matamos la tarea y nos quedamos quietos.
+            return;            
+        }
+        // ------------------------------------------------------------------
 
+        // Inicializar Protocolo
         err = CO_CANopenInit(CO, NULL, NULL, OD, NULL, 
                              NMT_CONTROL, 
                              CONFIG_CO_FIRST_HB_TIME,
@@ -174,9 +178,7 @@ static void CO_mainTask(void *pxParam)
                              
         CO_CANopenInitPDO(CO, CO->em, OD, activeNodeId, &errInfo);
 
-#if (CONFIG_CO_PERIODIC_TASK_PRIORITY <= CONFIG_CO_MAIN_TASK_PRIORITY)
-#error "Invalid CANopenNode task priority"
-#endif
+        // Crear tarea periódica si no existe
         if (xCoPeriodicTaskHandle == NULL)
         {
             xCoPeriodicTaskHandle = xTaskCreateStaticPinnedToCore(
@@ -190,63 +192,84 @@ static void CO_mainTask(void *pxParam)
 #endif
 
         CO_CANsetNormalMode(CO->CANmodule);
+        
+        // ---------------------------------------------------------------------
+        // IMPORTANTE: ACTIVAR MONITOR DE TRÁFICO (ESPÍA)
+        // Esto permite ver en el log si las tramas entran (RX) y si salen (TX)
+        // ---------------------------------------------------------------------
+        twai_reconfigure_alerts(TWAI_ALERT_RX_DATA | TWAI_ALERT_TX_SUCCESS | TWAI_ALERT_TX_FAILED, NULL);
+
         reset = CO_RESET_NOT;
         ESP_LOGI(TAG, "CANopenNode is running");
         
         xLastWakeTime = xTaskGetTickCount();
         xTimerUltimoEnvio = xTaskGetTickCount();
         b_emergencia_activa = false; 
-
-        // Limpiamos el semáforo por si se pulsó durante el reinicio
+        
+        // Limpiar semáforo inicial
         xSemaphoreTake(xSemaforoEmergencia, 0);
 
-        // ============================================================
-        // BUCLE PRINCIPAL
-        // ============================================================
+        // BUCLE OPERATIVO
         while (reset == CO_RESET_NOT)
         {
             vTaskDelayUntil(&xLastWakeTime, CONFIG_CO_MAIN_TASK_INTERVAL_MS);
             
-            // Proceso estándar de CANopen
+            // --- A. Proceso CANopen ---
             reset = CO_process(CO, false, CO_MAIN_TASK_INTERVAL_US, NULL);
 
-            // ------------------------------------------------------------
-            // 1. CHEQUEO DE INTERRUPCIÓN (SEMÁFORO)
-            // ------------------------------------------------------------
-            // xSemaphoreTake con tiempo 0 no bloquea. Solo mira si la ISR lo activó.
+            // --- B. Monitor de Tráfico (LOGS) ---
+            uint32_t alerts = 0;
+            twai_read_alerts(&alerts, 0); // Leer alertas sin bloquear
+            
+            if (alerts & TWAI_ALERT_RX_DATA) {
+                ESP_LOGI(TAG, ">>> [BUS] Trama Recibida (RX)");
+            }
+            if (alerts & TWAI_ALERT_TX_SUCCESS) {
+                ESP_LOGI(TAG, "<<< [BUS] Trama Enviada OK (TX ACK Recibido)");
+            }
+            if (alerts & TWAI_ALERT_TX_FAILED) {
+                ESP_LOGE(TAG, "xxx [BUS] Fallo de Envío (Nadie escucha o Error Bus)");
+            }
+
+            // --- C. Botón de Emergencia (TX por Evento) ---
             if (xSemaphoreTake(xSemaforoEmergencia, 0) == pdTRUE)
             {
-                // ¡Si entramos aquí es que se pulsó el botón y saltó la ISR!
                 if (!b_emergencia_activa) 
                 {
-                    ESP_LOGE(TAG, "!!! INTERRUPCIÓN HARDWARE RECIBIDA !!!");
+                    ESP_LOGE(TAG, "!!! BOTÓN: Enviando Emergencia CRÍTICA !!!");
                     b_emergencia_activa = true;
-                    
-                    // Enviamos el mensaje de emergencia de forma segura
+                    // Envia error 0x5000
                     CO_errorReport(CO->em, 1, CO_EMC_GENERIC, 0x5000);
                 }
             }
 
-            // Recuperación: Si estamos en emergencia y el botón YA NO está pulsado (1)
-            // (La recuperación no necesita ser por interrupción, puede ser por polling)
+            // Recuperación: Si estamos en emergencia y el botón YA NO está pulsado
             if (b_emergencia_activa && gpio_get_level(PIN_EMERGENCIA) == 1)
             {
                 b_emergencia_activa = false;
-                ESP_LOGI(TAG, "Emergencia finalizada (Botón soltado).");
+                
+                CO_errorReset(CO->em, 1, 0); 
+                
+                ESP_LOGI(TAG, "Botón soltado. Error limpiado. Listo para la próxima.");
             }
 
-            // ------------------------------------------------------------
-            // 2. LÓGICA DE ENVÍO CADA 1 SEGUNDO
-            // ------------------------------------------------------------
+            
+            // --- D. Envío Cíclico "Dummy" (Hack TX sin OD) ---
             TickType_t now = xTaskGetTickCount();
             if (!b_emergencia_activa && (now - xTimerUltimoEnvio > pdMS_TO_TICKS(1000)))
             {
                 xTimerUltimoEnvio = now;
                 u8_dato_dummy++;
                 
-                // OD_RAM.x6000_... = u8_dato_dummy; 
-                ESP_LOGI(TAG, "TX Enviado: %d", u8_dato_dummy);
+                // Usamos el canal de emergencia para enviar el dato crudo
+                uint32_t data_para_enviar = (uint32_t)u8_dato_dummy;
+                
+                ESP_LOGI(TAG, "Intentando enviar dato: %d ...", u8_dato_dummy);
+                
+                CO_errorReport(CO->em, 2, CO_EMC_GENERIC, data_para_enviar);
+                CO->em->errorStatusBits[2] = 0; // Limpiar bit inmediatamente para permitir el siguiente
             }
+                
         }
     }
 
@@ -257,17 +280,14 @@ static void CO_mainTask(void *pxParam)
     vTaskDelete(NULL);
 }
 
+// --------------------------------------------------------------------------
+// TAREA PERIÓDICA (TIMER 1ms)
+// --------------------------------------------------------------------------
 static void CO_periodicTask(void *pxParam)
 {
-    ESP_LOGI(TAG, "Periodic task running"); // Esto SÍ puede estar aquí (se ejecuta 1 vez)
-
     while (1)
     {
-        vTaskDelay(1); // Espera 1ms
-        
-        // --- AQUÍ DENTRO NO PONGAS NINGÚN ESP_LOG O PRINTF ---
-        // Imprimir cada 1ms colapsa el chip.
-        
+        vTaskDelay(1); 
         if ((!CO->nodeIdUnconfigured) && (CO->CANmodule->CANnormal))
         {
             bool syncWas = false;

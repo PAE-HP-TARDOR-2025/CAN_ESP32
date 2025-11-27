@@ -38,52 +38,49 @@ typedef struct
 } baudrate_config_t;
 
 static baudrate_config_t const baudrate_config[] = {
-#if CONFIG_CO_BPS_25K
     {25, TWAI_TIMING_CONFIG_25KBITS()},
-#endif
-#if CONFIG_CO_BPS_50K
     {50, TWAI_TIMING_CONFIG_50KBITS()},
-#endif
-#if CONFIG_CO_BPS_100K
     {100, TWAI_TIMING_CONFIG_100KBITS()},
-#endif
-#if CONFIG_CO_BPS_125K
     {125, TWAI_TIMING_CONFIG_125KBITS()},
-#endif
-#if CONFIG_CO_BPS_250K
     {250, TWAI_TIMING_CONFIG_250KBITS()},
-#endif
-#if CONFIG_CO_BPS_500K
-    {500, TWAI_TIMING_CONFIG_500KBITS()},
-#endif
-#if CONFIG_CO_BPS_1M
+    {500, TWAI_TIMING_CONFIG_500KBITS()}, 
+    {800, TWAI_TIMING_CONFIG_800KBITS()},
     {1000, TWAI_TIMING_CONFIG_1MBITS()},
-#endif
-#if CONFIG_CO_BPS_25K
-    {25, TWAI_TIMING_CONFIG_25KBITS()},
-#endif
 };
 
 // --- DEFINICIONES DE STACK Y PRIORIDAD FIJAS ---
-#define CONFIG_CO_TX_TASK_STACK_SIZE 4096
-#define CONFIG_CO_RX_TASK_STACK_SIZE 4096
-#define CONFIG_CO_TWAI_TX_GPIO 5
-#define CONFIG_CO_TWAI_RX_GPIO 4
+//#define CONFIG_CO_TX_TASK_STACK_SIZE 4096
+//#define CONFIG_CO_RX_TASK_STACK_SIZE 4096
+//#define CONFIG_CO_TWAI_TX_GPIO 5
+//#define CONFIG_CO_TWAI_RX_GPIO 4
 
 // 1. Tarea Prioridad (TX y RX)
-#define CONFIG_CO_TX_TASK_PRIORITY 10 
-#define CONFIG_CO_RX_TASK_PRIORITY 10 
+//#define CONFIG_CO_TX_TASK_PRIORITY 10 
+//#define CONFIG_CO_RX_TASK_PRIORITY 10
+// --- DEFINICIONES DE STACK Y PRIORIDAD FIJAS (Nombres corregidos) ---
+
+// Cambiamos CONFIG_ por DRV_ para evitar conflictos con el sistema
+#define DRV_TX_TASK_STACK_SIZE 4096
+#define DRV_RX_TASK_STACK_SIZE 4096
+
+// Pines Fijos
+#define DRV_TWAI_TX_GPIO 5
+#define DRV_TWAI_RX_GPIO 4
+
+// Prioridades
+#define DRV_TX_TASK_PRIORITY 10 
+#define DRV_RX_TASK_PRIORITY 10
 
 // 2. Núcleo
 #define CONFIG_CO_TASK_CORE 0
 
 static StaticTask_t xCoTxTaskBuffer;
-static StackType_t xCoTxStack[CONFIG_CO_TX_TASK_STACK_SIZE];
+static StackType_t xCoTxStack[DRV_TX_TASK_STACK_SIZE];
 static TaskHandle_t xCoTxTaskHandle = NULL;
 static void CO_txTask(void *pxParam);
 
 static StaticTask_t xCoRxTaskBuffer;
-static StackType_t xCoRxStack[CONFIG_CO_RX_TASK_STACK_SIZE];
+static StackType_t xCoRxStack[DRV_RX_TASK_STACK_SIZE];
 static TaskHandle_t xCoRxTaskHandle = NULL;
 static void CO_rxTask(void *pxParam);
 
@@ -183,7 +180,7 @@ CO_ReturnError_t CO_CANmodule_init(
     }
 
     /* Configure CAN module registers */
-    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(CONFIG_CO_TWAI_TX_GPIO, CONFIG_CO_TWAI_RX_GPIO, TWAI_MODE_NORMAL);
+    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(DRV_TWAI_TX_GPIO, DRV_TWAI_RX_GPIO, TWAI_MODE_NORMAL);
     twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
     twai_timing_config_t t_config;
     for (i = 0; i < (sizeof(baudrate_config) / sizeof(baudrate_config[0])); i++)
@@ -209,6 +206,9 @@ CO_ReturnError_t CO_CANmodule_init(
         CANmodule->xMutexODHdl = xSemaphoreCreateRecursiveMutexStatic(&(CANmodule->xMutexODBuf));
 
         /* Install TWAI */
+        // --- AÑADE ESTO PARA VER LA VERDAD ---
+        ESP_LOGE(TAG, ">>> DEBUG: Intentando iniciar CAN con TX=%d y RX=%d", g_config.tx_io, g_config.rx_io);
+        // -------------------------------------
         ESP_ERROR_CHECK(twai_driver_install(&g_config, &t_config, &f_config));
         ESP_LOGI(TAG, "Driver installed");
         ESP_ERROR_CHECK(twai_start());
@@ -221,9 +221,9 @@ CO_ReturnError_t CO_CANmodule_init(
         xCoTxTaskHandle = xTaskCreateStaticPinnedToCore(
             CO_txTask,
             "CO_tx",
-            CONFIG_CO_TX_TASK_STACK_SIZE,
+            DRV_TX_TASK_STACK_SIZE,
             (void *)CANmodule,
-            CONFIG_CO_TX_TASK_PRIORITY,
+            DRV_TX_TASK_PRIORITY,
             &xCoTxStack[0],
             &xCoTxTaskBuffer,
             CONFIG_CO_TASK_CORE);
@@ -237,9 +237,9 @@ CO_ReturnError_t CO_CANmodule_init(
         xCoRxTaskHandle = xTaskCreateStaticPinnedToCore(
             CO_rxTask,
             "CO_rx",
-            CONFIG_CO_RX_TASK_STACK_SIZE,
+            DRV_RX_TASK_STACK_SIZE,
             (void *)CANmodule,
-            CONFIG_CO_RX_TASK_PRIORITY,
+            DRV_RX_TASK_PRIORITY,
             &xCoRxStack[0],
             &xCoRxTaskBuffer,
             CONFIG_CO_TASK_CORE);

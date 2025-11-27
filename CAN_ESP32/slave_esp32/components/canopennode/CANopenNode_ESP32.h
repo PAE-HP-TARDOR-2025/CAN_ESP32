@@ -1,11 +1,9 @@
 #ifndef CANOPENNODE_ESP32_H
 #define CANOPENNODE_ESP32_H
 
-#if CONFIG_USE_CANOPENNODE
+#include <stdbool.h> // <--- IMPORTANTE: Necesario para que entienda qué es "bool"
 
-#include "CANopen.h"
+// Declaración de la función pública
+bool CO_ESP32_init(void);
 
-bool CO_ESP32_init();
-
-#endif /* CONFIG_USE_CANOPENNODE */
 #endif /* CANOPENNODE_ESP32_H */
