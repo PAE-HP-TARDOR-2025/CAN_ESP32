@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        "canopennode_esp32.h": "c",
+        "cstdint": "c"
+    }
+}
