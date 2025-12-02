@@ -67,3 +67,57 @@ void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(10000)); 
     }
 }
+
+/*
+#include <stdio.h>
+#include "nvs_flash.h"
+#include "driver/gpio.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+// Tu librería encapsulada
+#include "CANopen_LSS.h" 
+
+#define GPIO_BOTON_EMERGENCIA   GPIO_NUM_0 
+#define GPIO_CAN_ENABLE         GPIO_NUM_16 
+static const char *TAG = "APP_MAIN";
+
+// SETUP
+void setup_hardware_externo()
+{
+    ESP_LOGI(TAG, "Configurando hardware...");
+    
+    // Enable Transceptor
+    gpio_reset_pin(GPIO_CAN_ENABLE);
+    gpio_set_direction(GPIO_CAN_ENABLE, GPIO_MODE_OUTPUT);
+    gpio_set_level(GPIO_CAN_ENABLE, 1); 
+
+    // Botón
+    gpio_reset_pin(GPIO_BOTON_EMERGENCIA);
+    gpio_set_direction(GPIO_BOTON_EMERGENCIA, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(GPIO_BOTON_EMERGENCIA, GPIO_PULLUP_ONLY);
+}
+
+// MAIN
+void app_main(void)
+{
+    // Flash
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase(); nvs_flash_init();
+    }
+
+    setup_hardware_externo();
+
+    ESP_LOGI(TAG, "--- ARRANCANDO ---");
+
+    // Arrancar la librería (Velocidad 500, ID 0x20 para pruebas manuales)
+    CO_ESP32_LSS_Run(500, 0x20);
+
+    // Dormir
+    while(1) {
+        vTaskDelay(pdMS_TO_TICKS(10000)); 
+    }
+}
+*/
