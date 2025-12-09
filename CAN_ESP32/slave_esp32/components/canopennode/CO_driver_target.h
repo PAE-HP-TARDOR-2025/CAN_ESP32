@@ -41,6 +41,9 @@
 #include "CO_driver_custom.h"
 #endif
 
+#define CO_CONFIG_LSS (CO_CONFIG_LSS_SLAVE | CO_CONFIG_LSS_MASTER)
+#define CO_CONFIG_NMT (CO_CONFIG_NMT_MASTER | CO_CONFIG_NMT_SLAVE)
+
 #ifdef __cplusplus
 extern "C"
 {

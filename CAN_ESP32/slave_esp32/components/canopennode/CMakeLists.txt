@@ -5,6 +5,7 @@ idf_component_register(
         "OD.c"
         "CANopenNode_ESP32.c"
         "CANopen_LSS.c"
+        "CANopen_LSS_Master.c"
         
         # --- 301 (CANopen application layer) ---
         "301/CO_fifo.c"
