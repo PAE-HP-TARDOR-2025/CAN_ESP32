@@ -40,6 +40,8 @@ typedef enum {
 static CO_t *CO = NULL;
 static uint32_t heapMemoryUsed = 0;
 static LssState_t lssState = LSS_INIT;
+static bool log_config_id = false;
+static bool log_config_store = false;
 
 // Variables para el escaneo LSS
 static CO_LSSmaster_fastscan_t fastScan;
@@ -80,6 +82,8 @@ static void CO_mainTask(void *pxParam) {
 
         // Init LSS con los parámetros estándar (0x7E5/0x7E4)
         CO_LSSmaster_init(CO->LSSmaster, CO_LSSmaster_DEFAULT_TIMEOUT, CO->CANmodule, 0, 0x7E5, CO->CANmodule, 0, 0x7E4);
+        // Reducir timeout LSS para acelerar fast-scan y confirmaciones
+        CO_LSSmaster_changeTimeout(CO->LSSmaster, 200);
 
         uint32_t errInfo = 0;
         CO_CANopenInit(CO, NULL, NULL, OD, NULL, NMT_CONTROL, 1000, 1000, 1000, false, MASTER_NODE_ID, &errInfo);
@@ -105,6 +109,8 @@ static void CO_mainTask(void *pxParam) {
         
         // Reiniciamos la máquina de estados
         lssState = LSS_INIT;
+        log_config_id = false;
+        log_config_store = false;
         next_id_to_assign = ID_INICIO_ASIGNACION;
         uint32_t co_timer_us = MAIN_INTERVAL_MS * 1000;
 
@@ -117,16 +123,17 @@ static void CO_mainTask(void *pxParam) {
                 
                 case LSS_INIT:
                     // Limpiamos la estructura de escaneo
+                    log_config_id = false;
+                    log_config_store = false;
                     memset(&fastScan, 0, sizeof(fastScan));
                     
                     // Indicamos que queremos escanear TODOS los campos (Vendor, Product, Rev, Serial)
                     // En tu librería, poner un valor != 0 significa "Escanear este campo"
-                    fastScan.scan[0] = 1; 
-                    fastScan.scan[1] = 1; 
-                    fastScan.scan[2] = 1; 
-                    fastScan.scan[3] = 1; 
+                    fastScan.scan[CO_LSS_FASTSCAN_VENDOR_ID] = CO_LSSmaster_FS_SCAN;
+                    fastScan.scan[CO_LSS_FASTSCAN_PRODUCT]   = CO_LSSmaster_FS_SCAN;
+                    fastScan.scan[CO_LSS_FASTSCAN_REV]       = CO_LSSmaster_FS_SCAN;
+                    fastScan.scan[CO_LSS_FASTSCAN_SERIAL]    = CO_LSSmaster_FS_SCAN;
                     
-                    ESP_LOGW(TAG, ">>> Buscando nodo ID 255 (LSS FastScan)...");
                     lssState = LSS_SCANNING;
                     break;
 
@@ -137,11 +144,6 @@ static void CO_mainTask(void *pxParam) {
                         CO_LSSmaster_return_t ret = CO_LSSmaster_IdentifyFastscan(CO->LSSmaster, co_timer_us, &fastScan);
                         
                         if (ret == CO_LSSmaster_SCAN_FINISHED) {
-                            // ¡NODO ENCONTRADO!
-                            // En tu librería, el resultado se guarda en fastScan.found.addr
-                            uint32_t serial = fastScan.found.addr[3]; 
-                            ESP_LOGI(TAG, "¡NODO DETECTADO! Serial (MAC): ...%08lX", (unsigned long)serial);
-                            
                             lssState = LSS_CONFIG_ID;
                         }
                         else if (ret == CO_LSSmaster_SCAN_NOACK || ret == CO_LSSmaster_TIMEOUT) {
@@ -154,40 +156,52 @@ static void CO_mainTask(void *pxParam) {
                     break;
 
                 case LSS_CONFIG_ID:
-                    ESP_LOGI(TAG, "Asignando ID %d...", next_id_to_assign);
+                    if (!log_config_id) {
+                        ESP_LOGI(TAG, "Asignando ID %d...", next_id_to_assign);
+                        log_config_id = true;
+                    }
                     if (CO_LSSmaster_configureNodeId(CO->LSSmaster, co_timer_us, next_id_to_assign) == CO_LSSmaster_OK) {
                         lssState = LSS_CONFIG_STORE;
+                        log_config_store = false;
                     }
                     break;
 
                 case LSS_CONFIG_STORE:
-                    ESP_LOGI(TAG, "Guardando configuracion...");
-                    if (CO_LSSmaster_configureStore(CO->LSSmaster, co_timer_us) == CO_LSSmaster_OK) {
-                        lssState = LSS_ACTIVATE;
+                    if (!log_config_store) {
+                        ESP_LOGI(TAG, "Guardando configuracion...");
+                        log_config_store = true;
+                    }
+                    {
+                        CO_LSSmaster_return_t sret = CO_LSSmaster_configureStore(CO->LSSmaster, co_timer_us);
+                        if (sret == CO_LSSmaster_OK) {
+                            ESP_LOGI(TAG, "ID %d asignada y almacenada en el nodo.", next_id_to_assign);
+                            lssState = LSS_ACTIVATE;
+                        } else if (sret != CO_LSSmaster_WAIT_SLAVE) {
+                            ESP_LOGW(TAG, "Store LSS sin ACK (%d). Continuo sin persistir.", sret);
+                            lssState = LSS_ACTIVATE;
+                        }
                     }
                     break;
 
                 case LSS_ACTIVATE:
-                    ESP_LOGI(TAG, "Activando nodo...");
-                    // Activamos el nodo (requiere 2 argumentos en tu versión)
-                    if (CO_LSSmaster_ActivateBit(CO->LSSmaster, 0) == CO_LSSmaster_OK) {
-                        ESP_LOGI(TAG, "-> Nodo %d LISTO.", next_id_to_assign);
-                        
-                        next_id_to_assign++; // Preparamos ID para el siguiente
-                        
-                        // IMPORTANTE: Volvemos a empezar para buscar si hay OTRO nodo más
-                        lssState = LSS_INIT;
-                    }
+                    ESP_LOGI(TAG, "Nodo %d configurado (sin cambio de bitrate).", next_id_to_assign);
+                    next_id_to_assign++; // Preparamos ID para el siguiente
+                    // Volvemos a buscar más nodos sin ID
+                    lssState = LSS_INIT;
                     break;
 
                 case LSS_DONE:
-                    // Si llegamos aquí, es que no hay más nodos sin configurar.
-                    // Enviamos la señal para que todos trabajen.
+                    // Idle operativo, pero reintenta fast-scan periódicamente.
                     static int timer_start = 0;
-                    if (timer_start++ > 50) { // Cada 5 segundos refrescamos la orden
+                    static int rescan_ticks = 0;
+                    if (timer_start++ > 2) { // ~5 s
                         ESP_LOGI(TAG, "Red Operativa. Enviando NMT Start All.");
                         CO_NMT_sendCommand(CO->NMT, CO_NMT_ENTER_OPERATIONAL, 0);
                         timer_start = 0;
+                    }
+                    if (rescan_ticks++ > 2) { // ~3 s
+                        rescan_ticks = 0;
+                        lssState = LSS_INIT; // relanzar fast-scan por si aparece un nodo nuevo
                     }
                     break;
             }

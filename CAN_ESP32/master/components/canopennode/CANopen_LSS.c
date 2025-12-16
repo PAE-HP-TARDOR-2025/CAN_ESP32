@@ -55,151 +55,151 @@ static int config_storage(void){
 }
 #endif
 
-static uint32_t getSerialNumberFromMAC() {
-    uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_BASE);
-    return ((uint32_t)mac[2] << 24) | ((uint32_t)mac[3] << 16) | ((uint32_t)mac[4] << 8) | ((uint32_t)mac[5]);
-}
+// static uint32_t getSerialNumberFromMAC() {
+//     uint8_t mac[6];
+//     esp_read_mac(mac, ESP_MAC_BASE);
+//     return ((uint32_t)mac[2] << 24) | ((uint32_t)mac[3] << 16) | ((uint32_t)mac[4] << 8) | ((uint32_t)mac[5]);
+// }
 
 // -------------------------------------------------------------------------
 // TAREA PRINCIPAL (Con el Monitor "Espía" integrado dentro)
 // -------------------------------------------------------------------------
-static void co_main_task_thread(void *arg) {
-    CO_NMT_reset_cmd_t reset = CO_RESET_NOT;
-    void* CANptr = NULL;
+// static void co_main_task_thread(void *arg) {
+//     CO_NMT_reset_cmd_t reset = CO_RESET_NOT;
+//     void* CANptr = NULL;
     
-    uint16_t bitRate = g_bitRate;
-    uint8_t nodeId = g_nodeId;
-    uint8_t active_node_id = nodeId;
-    uint32_t serial_number = 0;
-    uint64_t lastTime_us = esp_timer_get_time();
+//     uint16_t bitRate = g_bitRate;
+//     uint8_t nodeId = g_nodeId;
+//     uint8_t active_node_id = nodeId;
+//     uint32_t serial_number = 0;
+//     uint64_t lastTime_us = esp_timer_get_time();
 
-    // 1. Memoria
-    CO = CO_new(NULL, &heapMemoryUsed);
-    if (!CO) { ESP_LOGE(TAG, "Fallo Memoria"); vTaskDelete(NULL); }
+//     // 1. Memoria
+//     CO = CO_new(NULL, &heapMemoryUsed);
+//     if (!CO) { ESP_LOGE(TAG, "Fallo Memoria"); vTaskDelete(NULL); }
 
-    // 2. Storage
-    #if (CO_CONFIG_STORAGE) & CO_CONFIG_STORAGE_ENABLE
-    if (config_storage() != 0) { 
-        ESP_LOGE(TAG, "Fallo Storage"); 
-        CO_delete(CO); vTaskDelete(NULL);
-    }
-    #endif
+//     // 2. Storage
+//     #if (CO_CONFIG_STORAGE) & CO_CONFIG_STORAGE_ENABLE
+//     if (config_storage() != 0) { 
+//         ESP_LOGE(TAG, "Fallo Storage"); 
+//         CO_delete(CO); vTaskDelete(NULL);
+//     }
+//     #endif
 
-    while(reset != CO_RESET_APP){
-        ESP_LOGI(TAG, "Iniciando Stack...");
+//     while(reset != CO_RESET_APP){
+//         ESP_LOGI(TAG, "Iniciando Stack...");
         
-        CO->CANmodule->CANnormal = false; 
-        CO_CANsetConfigurationMode(CANptr);
+//         CO->CANmodule->CANnormal = false; 
+//         CO_CANsetConfigurationMode(CANptr);
 
-        // 3. Init Driver
-        if(CO_CANinit(CO, CANptr, bitRate) != CO_ERROR_NO) {
-            ESP_LOGE(TAG, "Error Driver CAN");
-            vTaskDelay(pdMS_TO_TICKS(2000));
-            continue; 
-        }
+//         // 3. Init Driver
+//         if(CO_CANinit(CO, CANptr, bitRate) != CO_ERROR_NO) {
+//             ESP_LOGE(TAG, "Error Driver CAN");
+//             vTaskDelay(pdMS_TO_TICKS(2000));
+//             continue; 
+//         }
 
-        // 4. Init LSS
-        serial_number = getSerialNumberFromMAC();
-        CO_LSS_address_t lss_address = {
-            .identity = { .vendorID = OD_PERSIST_COMM.x1018_identity.vendor_ID,
-                          .productCode = OD_PERSIST_COMM.x1018_identity.productCode,
-                          .revisionNumber = OD_PERSIST_COMM.x1018_identity.revisionNumber,
-                          .serialNumber = serial_number }
-        };
-        CO_LSSinit(CO, &lss_address, &nodeId, &bitRate);
-        active_node_id = nodeId; 
+//         // 4. Init LSS
+//         serial_number = getSerialNumberFromMAC();
+//         CO_LSS_address_t lss_address = {
+//             .identity = { .vendorID = OD_PERSIST_COMM.x1018_identity.vendor_ID,
+//                           .productCode = OD_PERSIST_COMM.x1018_identity.productCode,
+//                           .revisionNumber = OD_PERSIST_COMM.x1018_identity.revisionNumber,
+//                           .serialNumber = serial_number }
+//         };
+//         CO_LSSinit(CO, &lss_address, &nodeId, &bitRate);
+//         active_node_id = nodeId; 
 
-        // 5. Init Protocolo
-        uint32_t errInfo = 0;
-        CO_CANopenInit(CO, NULL, NULL, OD, NULL, NMT_CONTROL, 500, 1000, 500, false, active_node_id, &errInfo);
-        CO_CANopenInitPDO(CO, CO->em, OD, active_node_id, &errInfo);
+//         // 5. Init Protocolo
+//         uint32_t errInfo = 0;
+//         CO_CANopenInit(CO, NULL, NULL, OD, NULL, NMT_CONTROL, 500, 1000, 500, false, active_node_id, &errInfo);
+//         CO_CANopenInitPDO(CO, CO->em, OD, active_node_id, &errInfo);
 
-        // ============================================================
-        // ACTIVAR MONITOR DE TRÁFICO (ESPÍA)
-        // Esto le dice al driver: "Avísame cuando llegue o salga algo"
-        // ============================================================
-        twai_reconfigure_alerts(TWAI_ALERT_RX_DATA | TWAI_ALERT_TX_SUCCESS | TWAI_ALERT_TX_FAILED, NULL);
+//         // ============================================================
+//         // ACTIVAR MONITOR DE TRÁFICO (ESPÍA)
+//         // Esto le dice al driver: "Avísame cuando llegue o salga algo"
+//         // ============================================================
+//         twai_reconfigure_alerts(TWAI_ALERT_RX_DATA | TWAI_ALERT_TX_SUCCESS | TWAI_ALERT_TX_FAILED, NULL);
         
-        // 6. Arrancar
-        CO_CANsetNormalMode(CO->CANmodule); 
-        reset = CO_RESET_NOT;
-        lastTime_us = esp_timer_get_time();
-        lastTime_dummy_us = lastTime_us; 
+//         // 6. Arrancar
+//         CO_CANsetNormalMode(CO->CANmodule); 
+//         reset = CO_RESET_NOT;
+//         lastTime_us = esp_timer_get_time();
+//         lastTime_dummy_us = lastTime_us; 
 
-        ESP_LOGI(TAG, "--- NODO OPERATIVO (ID: %d) ---", active_node_id);
+//         ESP_LOGI(TAG, "--- NODO OPERATIVO (ID: %d) ---", active_node_id);
 
-        while (reset == CO_RESET_NOT) {
-            vTaskDelay(pdMS_TO_TICKS(10)); // Watchdog fix
+//         while (reset == CO_RESET_NOT) {
+//             vTaskDelay(pdMS_TO_TICKS(10)); // Watchdog fix
             
-            uint64_t nowTime_us = esp_timer_get_time();
-            uint32_t timeDifference_us = (uint32_t)(nowTime_us - lastTime_us);
-            lastTime_us = nowTime_us;
+//             uint64_t nowTime_us = esp_timer_get_time();
+//             uint32_t timeDifference_us = (uint32_t)(nowTime_us - lastTime_us);
+//             lastTime_us = nowTime_us;
 
-            // Procesar protocolo
-            reset = CO_process(CO, false, timeDifference_us, NULL);
-            if (CO->LSSslave) CO_LSSslave_process(CO->LSSslave);
+//             // Procesar protocolo
+//             reset = CO_process(CO, false, timeDifference_us, NULL);
+//             if (CO->LSSslave) CO_LSSslave_process(CO->LSSslave);
 
-            // ============================================================
-            // 1. MONITOR DE TRÁFICO (AQUÍ ESTÁ LA MAGIA)
-            // Igual que en el Código A, leemos las alertas dentro del bucle
-            // ============================================================
-            uint32_t alerts = 0;
-            // Leemos alertas sin esperar (0ms)
-            if (twai_read_alerts(&alerts, 0) == ESP_OK) 
-            {
-                if (alerts & TWAI_ALERT_RX_DATA) {
-                    ESP_LOGI(TAG, ">>> [BUS] Trama Recibida (RX)");
-                }
-                if (alerts & TWAI_ALERT_TX_SUCCESS) {
-                    ESP_LOGI(TAG, "<<< [BUS] Trama Enviada OK (ACK)");
-                }
-                if (alerts & TWAI_ALERT_TX_FAILED) {
-                    ESP_LOGE(TAG, "xxx [BUS] Fallo Envio (Error Bus)");
-                }
-            }
+//             // ============================================================
+//             // 1. MONITOR DE TRÁFICO (AQUÍ ESTÁ LA MAGIA)
+//             // Igual que en el Código A, leemos las alertas dentro del bucle
+//             // ============================================================
+//             uint32_t alerts = 0;
+//             // Leemos alertas sin esperar (0ms)
+//             if (twai_read_alerts(&alerts, 0) == ESP_OK) 
+//             {
+//                 if (alerts & TWAI_ALERT_RX_DATA) {
+//                     ESP_LOGI(TAG, ">>> [BUS] Trama Recibida (RX)");
+//                 }
+//                 if (alerts & TWAI_ALERT_TX_SUCCESS) {
+//                     ESP_LOGI(TAG, "<<< [BUS] Trama Enviada OK (ACK)");
+//                 }
+//                 if (alerts & TWAI_ALERT_TX_FAILED) {
+//                     ESP_LOGE(TAG, "xxx [BUS] Fallo Envio (Error Bus)");
+//                 }
+//             }
 
-            // ============================================================
-            // 2. LÓGICA BOTÓN
-            // ============================================================
-            if (gpio_get_level(PIN_EMERGENCIA) == 0) { 
-                if (!b_emergencia_activa) {
-                    b_emergencia_activa = true;
-                    ESP_LOGE(TAG, "!!! BOTÓN: EMERGENCIA !!!");
-                    CO_errorReport(CO->em, 1, CO_EMC_GENERIC, 0x5000);
-                }
-            } else { 
-                if (b_emergencia_activa) {
-                    b_emergencia_activa = false;
-                    CO_errorReset(CO->em, 1, 0); 
-                    ESP_LOGI(TAG, "Botón soltado. Reset.");
-                }
-            }
+//             // ============================================================
+//             // 2. LÓGICA BOTÓN
+//             // ============================================================
+//             if (gpio_get_level(PIN_EMERGENCIA) == 0) { 
+//                 if (!b_emergencia_activa) {
+//                     b_emergencia_activa = true;
+//                     ESP_LOGE(TAG, "!!! BOTÓN: EMERGENCIA !!!");
+//                     CO_errorReport(CO->em, 1, CO_EMC_GENERIC, 0x5000);
+//                 }
+//             } else { 
+//                 if (b_emergencia_activa) {
+//                     b_emergencia_activa = false;
+//                     CO_errorReset(CO->em, 1, 0); 
+//                     ESP_LOGI(TAG, "Botón soltado. Reset.");
+//                 }
+//             }
 
-            // ============================================================
-            // 3. ENVÍO DUMMY
-            // ============================================================
-            if (!b_emergencia_activa && (nowTime_us - lastTime_dummy_us > 1000000)) { 
-                lastTime_dummy_us = nowTime_us;
-                u8_dato_dummy++;
-                ESP_LOGI(TAG, "TX Dummy: %d", u8_dato_dummy);
-                CO_errorReport(CO->em, 2, CO_EMC_GENERIC, (uint32_t)u8_dato_dummy);
-                CO->em->errorStatusBits[2] = 0; 
-            }
+//             // ============================================================
+//             // 3. ENVÍO DUMMY
+//             // ============================================================
+//             if (!b_emergencia_activa && (nowTime_us - lastTime_dummy_us > 1000000)) { 
+//                 lastTime_dummy_us = nowTime_us;
+//                 u8_dato_dummy++;
+//                 ESP_LOGI(TAG, "TX Dummy: %d", u8_dato_dummy);
+//                 CO_errorReport(CO->em, 2, CO_EMC_GENERIC, (uint32_t)u8_dato_dummy);
+//                 CO->em->errorStatusBits[2] = 0; 
+//             }
 
-            if(reset == CO_RESET_COMM) break; 
-        }
+//             if(reset == CO_RESET_COMM) break; 
+//         }
         
-        CO_CANsetConfigurationMode(CANptr);
-        CO_CANmodule_disable(CO->CANmodule); 
-    }
-    CO_delete(CO);
-    vTaskDelete(NULL);
-}
+//         CO_CANsetConfigurationMode(CANptr);
+//         CO_CANmodule_disable(CO->CANmodule); 
+//     }
+//     CO_delete(CO);
+//     vTaskDelete(NULL);
+// }
 
-// FUNCIÓN DE ARRANQUE PÚBLICA
-void CO_ESP32_LSS_Run(uint16_t pendingBitRate, uint8_t pendingNodeId) {
-    g_bitRate = pendingBitRate;
-    g_nodeId = pendingNodeId;
-    xTaskCreatePinnedToCore(co_main_task_thread, "CO_Task", TASK_STACK_SIZE, NULL, TASK_PRIORITY, NULL, TASK_CORE);
-}
+// // FUNCIÓN DE ARRANQUE PÚBLICA
+// void CO_ESP32_LSS_Run(uint16_t pendingBitRate, uint8_t pendingNodeId) {
+//     g_bitRate = pendingBitRate;
+//     g_nodeId = pendingNodeId;
+//     xTaskCreatePinnedToCore(co_main_task_thread, "CO_Task", TASK_STACK_SIZE, NULL, TASK_PRIORITY, NULL, TASK_CORE);
+// }

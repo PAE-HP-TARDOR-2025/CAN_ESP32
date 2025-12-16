@@ -54,7 +54,7 @@ void app_main(void)
     // Aquí solo dejamos un log para saber que el chip no se ha colgado.
     while(1) {
         vTaskDelay(pdMS_TO_TICKS(5000)); // Cada 5 segundos
-        ESP_LOGI(TAG, "Master (CPU 0) sigue vivo...");
+        //ESP_LOGI(TAG, "Master (CPU 0) sigue vivo...");
     }
 }
 
