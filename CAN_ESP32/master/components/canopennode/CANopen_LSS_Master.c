@@ -97,8 +97,8 @@ static void CO_mainTask(void *pxParam) {
         /* Registrar callback pre para despertar la tarea cuando llegue trama LSS */
         CO_LSSmaster_initCallbackPre(CO->LSSmaster, NULL, lss_master_signal);
 #endif
-        // Reducir timeout LSS para acelerar fast-scan y confirmaciones (más agresivo)
-        CO_LSSmaster_changeTimeout(CO->LSSmaster, 25);
+        // Reducir timeout LSS para acelerar fast-scan y confirmaciones
+        CO_LSSmaster_changeTimeout(CO->LSSmaster, 50);
 
         uint32_t errInfo = 0;
         CO_CANopenInit(CO, NULL, NULL, OD, NULL, NMT_CONTROL, 1000, 1000, 1000, false, MASTER_NODE_ID, &errInfo);
@@ -143,16 +143,13 @@ static void CO_mainTask(void *pxParam) {
                     log_config_store = false;
                     memset(&fastScan, 0, sizeof(fastScan));
                     
-                    // Intentamos MATCH con Vendor (+Product si está definido en el OD) para acelerar
+                    // Intentamos MATCH con Vendor/Product/Revision específicos para acelerar
                     fastScan.scan[CO_LSS_FASTSCAN_VENDOR_ID] = CO_LSSmaster_FS_MATCH;
-                    fastScan.match.identity.vendorID = OD_PERSIST_COMM.x1018_identity.vendor_ID;
-                    if (OD_PERSIST_COMM.x1018_identity.productCode != 0) {
-                        fastScan.scan[CO_LSS_FASTSCAN_PRODUCT] = CO_LSSmaster_FS_MATCH;
-                        fastScan.match.identity.productCode = OD_PERSIST_COMM.x1018_identity.productCode;
-                    } else {
-                        fastScan.scan[CO_LSS_FASTSCAN_PRODUCT] = CO_LSSmaster_FS_SKIP;
-                    }
-                    fastScan.scan[CO_LSS_FASTSCAN_REV]       = CO_LSSmaster_FS_SKIP;
+                    fastScan.match.identity.vendorID = 0xFFFF0001;
+                    fastScan.scan[CO_LSS_FASTSCAN_PRODUCT] = CO_LSSmaster_FS_MATCH;
+                    fastScan.match.identity.productCode = 0x00000001;
+                    fastScan.scan[CO_LSS_FASTSCAN_REV] = CO_LSSmaster_FS_MATCH;
+                    fastScan.match.identity.revisionNumber = 0x00000000;
                     fastScan.scan[CO_LSS_FASTSCAN_SERIAL]    = CO_LSSmaster_FS_SCAN;
                     
                     scan_start_us = esp_timer_get_time();
@@ -161,24 +158,34 @@ static void CO_mainTask(void *pxParam) {
 
                 case LSS_SCANNING:
                     {
-                        // Ejecutamos un paso del escaneo.
-                        // Esta función devuelve el ESTADO, no necesitamos mirar variables internas.
-                        CO_LSSmaster_return_t ret = CO_LSSmaster_IdentifyFastscan(CO->LSSmaster, co_timer_us, &fastScan);
-                        
+                        // Ejecutamos pasos del escaneo más rápidamente.
+                        CO_LSSmaster_return_t ret = CO_LSSmaster_WAIT_SLAVE;
+                        /* Use a small constant step (1 ms) for faster scans, independent of LSS timeout */
+                        uint32_t fast_step_us = 1000; /* 1 ms */
+                        const int max_steps = 200; /* up to ~200 ms total advance */
+                        int steps = 0;
+                        while ((ret == CO_LSSmaster_WAIT_SLAVE) && (steps++ < max_steps)) {
+                            ret = CO_LSSmaster_IdentifyFastscan(CO->LSSmaster, fast_step_us, &fastScan);
+                        }
+                        /* Fastscan step log suppressed to reduce output */
+
                         if (ret == CO_LSSmaster_SCAN_FINISHED) {
-                            // Nodo encontrado, calculemos tiempo desde el inicio del escaneo
                             uint32_t serial = fastScan.found.addr[3];
                             uint64_t now = esp_timer_get_time();
                             uint32_t elapsed_ms = (uint32_t)((now - scan_start_us) / 1000ULL);
-                            ESP_LOGI(TAG, "Nodo DETECTADO: serial ...%08" PRIX32 " (took %" PRIu32 " ms)", (uint32_t)serial, (uint32_t)elapsed_ms);
+                            ESP_LOGI(TAG, "Nodo DETECTADO: serial ...%08" PRIX32 " (took %" PRIu32 " ms, steps=%d)", (uint32_t)serial, (uint32_t)elapsed_ms, steps);
+                            /* Guardamos vendor/product del nodo para acelerar próximos scans */
+                            cached_vendor = fastScan.found.addr[0];
+                            cached_product = fastScan.found.addr[1];
                             lssState = LSS_CONFIG_ID;
                         }
                         else if (ret == CO_LSSmaster_SCAN_NOACK || ret == CO_LSSmaster_TIMEOUT) {
-                            // Nadie responde.
-                            ESP_LOGI(TAG, "Escaneo finalizado. No hay mas nodos nuevos.");
+                            uint64_t now_no = esp_timer_get_time();
+                            uint32_t elapsed_ms_no = (uint32_t)((now_no - scan_start_us) / 1000ULL);
+                            ESP_LOGI(TAG, "Escaneo finalizado (sin respuesta) después de %" PRIu32 " ms, pasos=%d.", elapsed_ms_no, steps);
                             lssState = LSS_DONE;
                         }
-                        // Si devuelve CO_LSSmaster_WAIT_SLAVE, seguimos aquí en la próxima vuelta.
+                        // Si devuelve CO_LSSmaster_WAIT_SLAVE, seguiremos avanzando en la siguiente iteración.
                     }
                     break;
 
@@ -201,9 +208,7 @@ static void CO_mainTask(void *pxParam) {
                     {
                         CO_LSSmaster_return_t sret = CO_LSSmaster_configureStore(CO->LSSmaster, co_timer_us);
                         if (sret == CO_LSSmaster_OK) {
-                            uint64_t now_store = esp_timer_get_time();
-                            uint32_t total_ms = (uint32_t)((now_store - scan_start_us) / 1000ULL);
-                            ESP_LOGI(TAG, "ID %u asignada y almacenada en el nodo. (total %" PRIu32 " ms)", (unsigned int)next_id_to_assign, (uint32_t)total_ms);
+                            ESP_LOGI(TAG, "ID %d asignada y almacenada en el nodo.", next_id_to_assign);
                             lssState = LSS_ACTIVATE;
                         } else if (sret != CO_LSSmaster_WAIT_SLAVE) {
                             ESP_LOGW(TAG, "Store LSS sin ACK (%d). Continuo sin persistir.", sret);

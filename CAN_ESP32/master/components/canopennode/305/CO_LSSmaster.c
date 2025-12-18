@@ -78,19 +78,27 @@ CO_LSSmaster_receive(void* object, void* msg) {
     LSSmaster = (CO_LSSmaster_t*)object; /* this is the correct pointer type of the first argument */
 
     /* verify message length and message overflow (previous message was not processed yet). */
-    if ((DLC == 8U) && !CO_FLAG_READ(LSSmaster->CANrxNew) && (LSSmaster->command != CO_LSSmaster_COMMAND_WAITING)) {
+    if (DLC == 8U) {
+        uint16_t ident = CO_CANrxMsg_readIdent(msg);
+        ESP_LOGI("LSS_MASTER", "RX ID 0x%03X data: [%02X %02X %02X %02X %02X %02X %02X %02X] cmd=%d CANrxNew=%d",
+                 ident,
+                 data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+                 (int)LSSmaster->command, (int)CO_FLAG_READ(LSSmaster->CANrxNew));
 
-        /* copy data and set 'new message' flag */
-        (void)memcpy(LSSmaster->CANrxData, data, sizeof(LSSmaster->CANrxData));
+        if (!CO_FLAG_READ(LSSmaster->CANrxNew) && (LSSmaster->command != CO_LSSmaster_COMMAND_WAITING)) {
 
-        CO_FLAG_SET(LSSmaster->CANrxNew);
+            /* copy data and set 'new message' flag */
+            (void)memcpy(LSSmaster->CANrxData, data, sizeof(LSSmaster->CANrxData));
 
-#if ((CO_CONFIG_LSS)&CO_CONFIG_FLAG_CALLBACK_PRE) != 0
-        /* Optional signal to RTOS, which can resume task, which handles further processing. */
-        if (LSSmaster->pFunctSignal != NULL) {
-            LSSmaster->pFunctSignal(LSSmaster->functSignalObject);
+            CO_FLAG_SET(LSSmaster->CANrxNew);
+
+    #if ((CO_CONFIG_LSS)&CO_CONFIG_FLAG_CALLBACK_PRE) != 0
+            /* Optional signal to RTOS, which can resume task, which handles further processing. */
+            if (LSSmaster->pFunctSignal != NULL) {
+                LSSmaster->pFunctSignal(LSSmaster->functSignalObject);
+            }
+    #endif
         }
-#endif
     }
 }
 
