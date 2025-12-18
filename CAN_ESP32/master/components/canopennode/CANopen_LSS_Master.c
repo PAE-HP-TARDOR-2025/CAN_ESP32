@@ -9,6 +9,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <string.h>
+#include <inttypes.h>
 
 // --- CONFIGURACIÓN ---
 #define MASTER_NODE_ID       0x01
@@ -21,7 +22,7 @@
 // Tiempos RTOS
 #define MAIN_TASK_PRIO       4
 #define PERIODIC_TASK_PRIO   5
-#define MAIN_INTERVAL_MS     100
+#define MAIN_INTERVAL_MS     10
 #define PERIODIC_INTERVAL_MS 10 
 
 // Macro NMT
@@ -46,11 +47,21 @@ static bool log_config_store = false;
 // Variables para el escaneo LSS
 static CO_LSSmaster_fastscan_t fastScan;
 static uint8_t next_id_to_assign = ID_INICIO_ASIGNACION;
+static uint64_t scan_start_us = 0;
+static uint32_t cached_vendor = 0;
+static uint32_t cached_product = 0;
+static bool cached_vendor_known = false;
 
 TaskHandle_t mainTaskHandle = NULL;
 TaskHandle_t periodicTaskHandle = NULL;
 
 static void CO_mainTask(void *pxParam);
+#if (((CO_CONFIG_LSS)&CO_CONFIG_FLAG_CALLBACK_PRE) != 0)
+static void lss_master_signal(void* object) {
+    (void)object;
+    if (mainTaskHandle) xTaskNotifyGive(mainTaskHandle);
+}
+#endif
 static void CO_periodicTask(void *pxParam);
 
 // Callback de Emergencia
@@ -82,8 +93,12 @@ static void CO_mainTask(void *pxParam) {
 
         // Init LSS con los parámetros estándar (0x7E5/0x7E4)
         CO_LSSmaster_init(CO->LSSmaster, CO_LSSmaster_DEFAULT_TIMEOUT, CO->CANmodule, 0, 0x7E5, CO->CANmodule, 0, 0x7E4);
-        // Reducir timeout LSS para acelerar fast-scan y confirmaciones
-        CO_LSSmaster_changeTimeout(CO->LSSmaster, 200);
+#if (((CO_CONFIG_LSS)&CO_CONFIG_FLAG_CALLBACK_PRE) != 0)
+        /* Registrar callback pre para despertar la tarea cuando llegue trama LSS */
+        CO_LSSmaster_initCallbackPre(CO->LSSmaster, NULL, lss_master_signal);
+#endif
+        // Reducir timeout LSS para acelerar fast-scan y confirmaciones (más agresivo)
+        CO_LSSmaster_changeTimeout(CO->LSSmaster, 25);
 
         uint32_t errInfo = 0;
         CO_CANopenInit(CO, NULL, NULL, OD, NULL, NMT_CONTROL, 1000, 1000, 1000, false, MASTER_NODE_ID, &errInfo);
@@ -115,7 +130,8 @@ static void CO_mainTask(void *pxParam) {
         uint32_t co_timer_us = MAIN_INTERVAL_MS * 1000;
 
         while (reset == CO_RESET_NOT) {
-            vTaskDelay(pdMS_TO_TICKS(MAIN_INTERVAL_MS)); 
+            /* Espera por notificación (LSS pre-callback) o timeout de ciclo */
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(MAIN_INTERVAL_MS));
             reset = CO_process(CO, false, co_timer_us, NULL);
             
             // --- MÁQUINA DE ESTADOS LSS FASTSCAN ---
@@ -127,13 +143,19 @@ static void CO_mainTask(void *pxParam) {
                     log_config_store = false;
                     memset(&fastScan, 0, sizeof(fastScan));
                     
-                    // Indicamos que queremos escanear TODOS los campos (Vendor, Product, Rev, Serial)
-                    // En tu librería, poner un valor != 0 significa "Escanear este campo"
-                    fastScan.scan[CO_LSS_FASTSCAN_VENDOR_ID] = CO_LSSmaster_FS_SCAN;
-                    fastScan.scan[CO_LSS_FASTSCAN_PRODUCT]   = CO_LSSmaster_FS_SCAN;
-                    fastScan.scan[CO_LSS_FASTSCAN_REV]       = CO_LSSmaster_FS_SCAN;
+                    // Intentamos MATCH con Vendor (+Product si está definido en el OD) para acelerar
+                    fastScan.scan[CO_LSS_FASTSCAN_VENDOR_ID] = CO_LSSmaster_FS_MATCH;
+                    fastScan.match.identity.vendorID = OD_PERSIST_COMM.x1018_identity.vendor_ID;
+                    if (OD_PERSIST_COMM.x1018_identity.productCode != 0) {
+                        fastScan.scan[CO_LSS_FASTSCAN_PRODUCT] = CO_LSSmaster_FS_MATCH;
+                        fastScan.match.identity.productCode = OD_PERSIST_COMM.x1018_identity.productCode;
+                    } else {
+                        fastScan.scan[CO_LSS_FASTSCAN_PRODUCT] = CO_LSSmaster_FS_SKIP;
+                    }
+                    fastScan.scan[CO_LSS_FASTSCAN_REV]       = CO_LSSmaster_FS_SKIP;
                     fastScan.scan[CO_LSS_FASTSCAN_SERIAL]    = CO_LSSmaster_FS_SCAN;
                     
+                    scan_start_us = esp_timer_get_time();
                     lssState = LSS_SCANNING;
                     break;
 
@@ -144,6 +166,11 @@ static void CO_mainTask(void *pxParam) {
                         CO_LSSmaster_return_t ret = CO_LSSmaster_IdentifyFastscan(CO->LSSmaster, co_timer_us, &fastScan);
                         
                         if (ret == CO_LSSmaster_SCAN_FINISHED) {
+                            // Nodo encontrado, calculemos tiempo desde el inicio del escaneo
+                            uint32_t serial = fastScan.found.addr[3];
+                            uint64_t now = esp_timer_get_time();
+                            uint32_t elapsed_ms = (uint32_t)((now - scan_start_us) / 1000ULL);
+                            ESP_LOGI(TAG, "Nodo DETECTADO: serial ...%08" PRIX32 " (took %" PRIu32 " ms)", (uint32_t)serial, (uint32_t)elapsed_ms);
                             lssState = LSS_CONFIG_ID;
                         }
                         else if (ret == CO_LSSmaster_SCAN_NOACK || ret == CO_LSSmaster_TIMEOUT) {
@@ -174,7 +201,9 @@ static void CO_mainTask(void *pxParam) {
                     {
                         CO_LSSmaster_return_t sret = CO_LSSmaster_configureStore(CO->LSSmaster, co_timer_us);
                         if (sret == CO_LSSmaster_OK) {
-                            ESP_LOGI(TAG, "ID %d asignada y almacenada en el nodo.", next_id_to_assign);
+                            uint64_t now_store = esp_timer_get_time();
+                            uint32_t total_ms = (uint32_t)((now_store - scan_start_us) / 1000ULL);
+                            ESP_LOGI(TAG, "ID %u asignada y almacenada en el nodo. (total %" PRIu32 " ms)", (unsigned int)next_id_to_assign, (uint32_t)total_ms);
                             lssState = LSS_ACTIVATE;
                         } else if (sret != CO_LSSmaster_WAIT_SLAVE) {
                             ESP_LOGW(TAG, "Store LSS sin ACK (%d). Continuo sin persistir.", sret);
@@ -191,16 +220,17 @@ static void CO_mainTask(void *pxParam) {
                     break;
 
                 case LSS_DONE:
-                    // Idle operativo, pero reintenta fast-scan periódicamente.
+                    // Idle operativo, reintenta fast-scan periódicamente (cada 1s) usando tiempo real
                     static int timer_start = 0;
-                    static int rescan_ticks = 0;
-                    if (timer_start++ > 2) { // ~5 s
+                    static uint64_t last_rescan_us = 0;
+                    uint64_t now_us = esp_timer_get_time();
+                    if (timer_start++ > 50) { // ~5 s
                         ESP_LOGI(TAG, "Red Operativa. Enviando NMT Start All.");
                         CO_NMT_sendCommand(CO->NMT, CO_NMT_ENTER_OPERATIONAL, 0);
                         timer_start = 0;
                     }
-                    if (rescan_ticks++ > 2) { // ~3 s
-                        rescan_ticks = 0;
+                    if ((now_us - last_rescan_us) > 1000000ULL) { // 1 segundo
+                        last_rescan_us = now_us;
                         lssState = LSS_INIT; // relanzar fast-scan por si aparece un nodo nuevo
                     }
                     break;
