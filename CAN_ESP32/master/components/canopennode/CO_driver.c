@@ -545,6 +545,10 @@ static void CO_txTask(void *pxParam)
         /* Are there any new messages waiting to be send */
         while (CANmodule->CANtxCount > 0U)
         {
+            /* Limit bursting to avoid monopolizing CPU and to keep WDT happy. */
+            int txBurst = 0;
+            bool messageSentInThisPass = false;
+
             /* search through whole array of pointers to transmit message buffers. */
             for (int i = 0; i < CANmodule->txSize; i++)
             {
@@ -567,8 +571,26 @@ static void CO_txTask(void *pxParam)
                     }
                     CANmodule->CANtxCount--;
                     CANmodule->bufferInhibitFlag = pCanTx->syncFlag;
+
+                    /* Track burst size and yield occasionally to avoid watchdog */
+                    txBurst++;
+                    messageSentInThisPass = true;
+                    if ((txBurst & 0x07) == 0) {
+                        /* allow other tasks and the idle to run, and give peripheral time */
+                        CO_UNLOCK_CAN_SEND(CANmodule);
+                        vTaskDelay(pdMS_TO_TICKS(10));
+                        CO_LOCK_CAN_SEND(CANmodule);
+                    }
+
                     break; /* exit for loop */
                 }
+            }
+
+            /* If we scanned all buffers and didn't send any message, yield briefly to avoid busy-looping */
+            if (!messageSentInThisPass) {
+                CO_UNLOCK_CAN_SEND(CANmodule);
+                vTaskDelay(pdMS_TO_TICKS(10));
+                CO_LOCK_CAN_SEND(CANmodule);
             }
         }
         CO_UNLOCK_CAN_SEND(CANmodule);

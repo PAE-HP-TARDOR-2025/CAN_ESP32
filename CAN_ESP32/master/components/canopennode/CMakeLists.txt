@@ -4,7 +4,7 @@ idf_component_register(
         "CO_driver.c"
         "OD.c"
         "CANopenNode_ESP32.c"
-        "CANopen_LSS.c"
+       
         "CANopen_LSS_Master.c"
         
         # --- 301 (CANopen application layer) ---
