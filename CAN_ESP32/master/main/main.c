@@ -4,6 +4,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_spiffs.h"
 
 // Incluimos la cabecera de TU lógica de Master
 #include "CANopen_LSS_Master.h"
@@ -45,11 +46,38 @@ void app_main(void)
     ESP_LOGI(TAG, "   ARRANCANDO ESP32 CANOPEN MASTER      ");
     ESP_LOGI(TAG, "========================================");
 
-    // 3. Ejecutar la lógica del Master
-    // Esta función crea las tareas (Main + Periodic) y retorna inmediatamente.
+    // 3. Montar SPIFFS para acceder a la imagen de firmware (ej. /spiffs/slave.bin)
+    const esp_vfs_spiffs_conf_t conf = {
+        .base_path = "/spiffs",
+        .partition_label = "storage",  // Especificar la partición SPIFFS
+        .max_files = 4,
+        .format_if_mount_failed = false,
+    };
+    esp_err_t spiffs_err = esp_vfs_spiffs_register(&conf);
+    if (spiffs_err != ESP_OK) {
+        ESP_LOGE(TAG, "ERROR: SPIFFS no montado (0x%x). OTA no funcionará.", (unsigned)spiffs_err);
+    } else {
+        size_t total = 0, used = 0;
+        if (esp_spiffs_info(conf.partition_label, &total, &used) == ESP_OK) {
+            ESP_LOGI(TAG, "SPIFFS montado OK: total=%u used=%u", (unsigned)total, (unsigned)used);
+            
+            // Verificar que slave.bin existe
+            FILE *f = fopen("/spiffs/slave.bin", "rb");
+            if (f) {
+                fseek(f, 0, SEEK_END);
+                long size = ftell(f);
+                fclose(f);
+                ESP_LOGI(TAG, "Firmware slave.bin encontrado: %ld bytes", size);
+            } else {
+                ESP_LOGE(TAG, "ERROR: /spiffs/slave.bin NO encontrado!");
+            }
+        }
+    }
+
+    // 4. Ejecutar la lógica del Master (crea tareas y retorna)
     CO_ESP32_Master_Run();
 
-    // 4. Bucle infinito del Main
+    // 5. Bucle infinito del Main
     // El trabajo real lo hacen las tareas creadas arriba.
     // Aquí solo dejamos un log para saber que el chip no se ha colgado.
     while(1) {

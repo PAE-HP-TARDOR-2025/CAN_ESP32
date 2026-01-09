@@ -23,8 +23,8 @@
 
 #include <string.h>
 
-#include "CO_config.h"
 #include "CO_driver_target.h"
+#include "CO_config.h"
 
 #ifdef __cplusplus
 extern "C" {

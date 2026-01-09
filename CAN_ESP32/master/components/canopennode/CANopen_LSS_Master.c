@@ -8,6 +8,8 @@
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "fw_master_update.h"
 #include <string.h>
 #include <inttypes.h>
 
@@ -16,6 +18,10 @@
 #define MASTER_NODE_ID       0x01
 #define MASTER_BITRATE       500   // IMPORTANTE: Debe coincidir con el Esclavo
 #define TAG "MASTER_LSS"
+// Modo compatibilidad v1: desactivar PDO para evitar RX Data del esclavo v2
+#ifndef MASTER_ENABLE_PDO
+#define MASTER_ENABLE_PDO 0
+#endif
 
 
 // Empezaremos asignando la ID 16. Si hay otro, le dará la 17.
@@ -72,6 +78,7 @@ typedef struct {
     CO_LSS_address_t addr;
     uint64_t skip_until_us; /* until what time to skip (esp_timer_get_time() units) */
     uint8_t assigned_node_id; /* ID previously assigned to this node */
+    bool upload_launched;     /* true if firmware upload task already started for this node */
 } configured_node_t;
 
 
@@ -80,9 +87,39 @@ static int configured_nodes_count = 0;
 /* Global rescan timestamp used by LSS_DONE state to schedule next rescan */
 static uint64_t last_rescan_us_global = 0;
 
+/* Find the next free node-id not used in configured_nodes. Wraps around on 127. */
+static uint8_t find_next_free_node_id(void) {
+    uint8_t candidate = ID_INICIO_ASIGNACION;
+    while (true) {
+        bool used = false;
+        for (int i = 0; i < configured_nodes_count; i++) {
+            if (configured_nodes[i].assigned_node_id == candidate) {
+                used = true;
+                break;
+            }
+        }
+        if (!used && candidate != MASTER_NODE_ID) {
+            return candidate;
+        }
+        candidate = (candidate < 127) ? (uint8_t)(candidate + 1) : 2;
+    }
+}
+
+/* Firmware update plan */
+#define FW_IMAGE_PATH   "/spiffs/slave.bin"
+#define FW_TARGET_BANK  1
+#define FW_MAX_CHUNK    256U
+#define FW_VERSION      2
+
+typedef struct {
+    uint8_t nodeId;
+} fw_upload_args_t;
+
+static SemaphoreHandle_t sdoMutex = NULL;
+
 
 // Re-scan interval (ms) para preguntar por nodos nuevos conectados posteriormente
-#define RESCAN_INTERVAL_MS 5000
+#define RESCAN_INTERVAL_MS 10000
 // Tiempo que esperamos tras deseleccionar (ms) para que el esclavo haga reset/apply NID
 // Incrementado para dar más tiempo al esclavo a aplicar la configuración
 #define DESELECT_DELAY_MS 1000
@@ -104,6 +141,8 @@ static int selection_verify_attempts = 0; /* intentos de selección para verific
 TaskHandle_t mainTaskHandle = NULL;
 TaskHandle_t periodicTaskHandle = NULL;
 
+/* SDO client reference (como en el demo de firmware_updater) */
+static CO_SDOclient_t *g_sdoClient = NULL;
 
 static void CO_mainTask(void *pxParam);
 #if (((CO_CONFIG_LSS)&CO_CONFIG_FLAG_CALLBACK_PRE) != 0)
@@ -113,6 +152,272 @@ static void lss_master_signal(void* object) {
 }
 #endif
 static void CO_periodicTask(void *pxParam);
+
+/* -------------------------------------------------------------------------- */
+/* Helpers SDO para el uploader                                               */
+/* -------------------------------------------------------------------------- */
+
+static TickType_t wait_ticks(uint32_t ms) {
+    TickType_t ticks = pdMS_TO_TICKS(ms);
+    return (ticks > 0) ? ticks : 1;
+}
+
+static bool sdo_download(uint8_t nodeId, uint16_t index, uint8_t subIndex, const uint8_t *data, size_t len) {
+    if (g_sdoClient == NULL) {
+        ESP_LOGE(TAG, "SDO client not available");
+        return false;
+    }
+    
+    CO_SDOclient_t *client = g_sdoClient;
+    CO_SDO_abortCode_t abortCode = CO_SDO_AB_NONE;
+    size_t sizeTransferred = 0;
+
+    CO_SDOclient_setup(client, 0x600 + nodeId, 0x580 + nodeId, nodeId);
+    CO_SDO_return_t ret = CO_SDOclientDownloadInitiate(client, index, subIndex, len, 3000, true);
+    if (ret < CO_SDO_RT_ok_communicationEnd) {
+        ESP_LOGE(TAG, "SDO download init failed: ret=%d idx=0x%04X:%u", ret, index, subIndex);
+        return false;
+    }
+
+    size_t offset = 0;
+    bool bufferPartial = true;
+    uint64_t start_us = esp_timer_get_time();
+    const uint64_t timeout_us = 2000000ULL; /* 2s guard */
+    bool timed_out = false;
+    do {
+        if (offset < len) {
+            size_t written = CO_SDOclientDownloadBufWrite(client, data + offset, len - offset);
+            offset += written;
+            bufferPartial = (offset < len);
+        } else {
+            bufferPartial = false;
+        }
+        ret = CO_SDOclientDownload(client, 1000, false, bufferPartial, &abortCode, &sizeTransferred, NULL);
+        if (ret == CO_SDO_RT_waitingResponse) {
+            if ((esp_timer_get_time() - start_us) > timeout_us) {
+                timed_out = true;
+                break;
+            }
+            vTaskDelay(wait_ticks(1));
+        }
+    } while (ret > CO_SDO_RT_ok_communicationEnd);
+
+    if (timed_out || ret != CO_SDO_RT_ok_communicationEnd) {
+        ESP_LOGE(TAG, "SDO download failed: ret=%d abort=0x%08lX idx=0x%04X:%u%s", ret, (unsigned long)abortCode, index, subIndex, timed_out ? " (timeout)" : "");
+        return false;
+    }
+    return true;
+}
+
+static bool sdo_upload(uint8_t nodeId, uint16_t index, uint8_t subIndex, uint8_t *buf, size_t maxLen, size_t *actualLen) {
+    if (g_sdoClient == NULL) {
+        ESP_LOGE(TAG, "SDO client not available");
+        return false;
+    }
+    
+    CO_SDOclient_t *client = g_sdoClient;
+    CO_SDO_abortCode_t abortCode = CO_SDO_AB_NONE;
+    size_t sizeTransferred = 0;
+    size_t sizeIndicated = 0;
+
+    CO_SDOclient_setup(client, 0x600 + nodeId, 0x580 + nodeId, nodeId);
+    CO_SDO_return_t ret = CO_SDOclientUploadInitiate(client, index, subIndex, 3000, true);
+    if (ret < CO_SDO_RT_ok_communicationEnd) {
+        ESP_LOGE(TAG, "SDO upload init failed: ret=%d idx=0x%04X:%u", ret, index, subIndex);
+        return false;
+    }
+
+    uint64_t start_us = esp_timer_get_time();
+    const uint64_t timeout_us = 2000000ULL; /* 2s guard */
+    bool timed_out = false;
+    do {
+        ret = CO_SDOclientUpload(client, 1000, false, &abortCode, &sizeIndicated, &sizeTransferred, NULL);
+        if (ret == CO_SDO_RT_waitingResponse) {
+            if ((esp_timer_get_time() - start_us) > timeout_us) {
+                timed_out = true;
+                break;
+            }
+            vTaskDelay(wait_ticks(1));
+        }
+    } while (ret > CO_SDO_RT_ok_communicationEnd);
+
+    if (timed_out || ret != CO_SDO_RT_ok_communicationEnd) {
+        ESP_LOGE(TAG, "SDO upload failed: ret=%d abort=0x%08lX idx=0x%04X:%u%s", ret, (unsigned long)abortCode, index, subIndex, timed_out ? " (timeout)" : "");
+        return false;
+    }
+    size_t read = CO_SDOclientUploadBufRead(client, buf, maxLen);
+    if (actualLen) *actualLen = read;
+    return true;
+}
+
+/* Probe mínimo para saber si un nodo con ID responde por SDO sin generar logs de error. */
+static bool sdo_probe_node(uint8_t nodeId) {
+    if (g_sdoClient == NULL) {
+        return false;
+    }
+
+    CO_SDOclient_t *client = g_sdoClient;
+    CO_SDO_abortCode_t abortCode = CO_SDO_AB_NONE;
+    size_t sizeTransferred = 0;
+    size_t sizeIndicated = 0;
+
+    /* Configurar SDO a la ID indicada */
+    CO_SDOclient_setup(client, 0x600 + nodeId, 0x580 + nodeId, nodeId);
+    CO_SDO_return_t ret = CO_SDOclientUploadInitiate(client, 0x1000, 0, 500, true); /* 0x1000 = Device Type */
+    if (ret < CO_SDO_RT_ok_communicationEnd) {
+        return false; /* no responde */
+    }
+
+    uint64_t start_us = esp_timer_get_time();
+    const uint64_t timeout_us = 500000ULL; /* 500 ms total guard for probe */
+    do {
+        ret = CO_SDOclientUpload(client, 300, false, &abortCode, &sizeIndicated, &sizeTransferred, NULL);
+        if (ret == CO_SDO_RT_waitingResponse) {
+            if ((esp_timer_get_time() - start_us) > timeout_us) {
+                return false;
+            }
+            vTaskDelay(wait_ticks(1));
+        }
+    } while (ret > CO_SDO_RT_ok_communicationEnd);
+
+    if (ret != CO_SDO_RT_ok_communicationEnd) {
+        return false;
+    }
+
+    /* Leemos pero no usamos el valor; solo importa que respondió. */
+    uint8_t tmpBuf[4];
+    CO_SDOclientUploadBufRead(client, tmpBuf, sizeof(tmpBuf));
+    return true;
+}
+
+bool fw_master_send_metadata(const fw_upload_plan_t *plan, const fw_payload_t *payload, uint16_t crc) {
+    uint8_t meta[10];
+    uint32_t size = (uint32_t)payload->size;
+    meta[0] = (uint8_t)(size & 0xFF);
+    meta[1] = (uint8_t)((size >> 8) & 0xFF);
+    meta[2] = (uint8_t)((size >> 16) & 0xFF);
+    meta[3] = (uint8_t)((size >> 24) & 0xFF);
+    meta[4] = (uint8_t)(crc & 0xFF);
+    meta[5] = (uint8_t)((crc >> 8) & 0xFF);
+    meta[6] = (uint8_t)plan->type;
+    meta[7] = plan->targetBank;
+    meta[8] = (uint8_t)(plan->firmwareVersion & 0xFF);
+    meta[9] = (uint8_t)((plan->firmwareVersion >> 8) & 0xFF);
+
+    if (sdoMutex == NULL) sdoMutex = xSemaphoreCreateMutex();
+    if (sdoMutex == NULL) return false;
+    xSemaphoreTake(sdoMutex, portMAX_DELAY);
+    bool ok = sdo_download(plan->targetNodeId, 0x1F57, 1, meta, sizeof(meta));
+    xSemaphoreGive(sdoMutex);
+    return ok;
+}
+
+bool fw_master_send_start_command(const fw_upload_plan_t *plan) {
+    uint8_t cmd[3] = {0x01, 0x00, 0x00};
+    if (sdoMutex == NULL) sdoMutex = xSemaphoreCreateMutex();
+    if (sdoMutex == NULL) return false;
+    xSemaphoreTake(sdoMutex, portMAX_DELAY);
+    bool ok = sdo_download(plan->targetNodeId, 0x1F51, 1, cmd, sizeof(cmd));
+    xSemaphoreGive(sdoMutex);
+    return ok;
+}
+
+bool fw_master_send_chunk(const fw_upload_plan_t *plan, const uint8_t *chunk, size_t len, size_t offset) {
+    (void)offset;
+    if (sdoMutex == NULL) sdoMutex = xSemaphoreCreateMutex();
+    if (sdoMutex == NULL) return false;
+    xSemaphoreTake(sdoMutex, portMAX_DELAY);
+    bool ok = sdo_download(plan->targetNodeId, 0x1F50, 1, chunk, len);
+    xSemaphoreGive(sdoMutex);
+    return ok;
+}
+
+bool fw_master_send_finalize_request(const fw_upload_plan_t *plan, uint16_t crc) {
+    uint8_t status[2] = {(uint8_t)(crc & 0xFF), (uint8_t)((crc >> 8) & 0xFF)};
+    if (sdoMutex == NULL) sdoMutex = xSemaphoreCreateMutex();
+    if (sdoMutex == NULL) return false;
+    xSemaphoreTake(sdoMutex, portMAX_DELAY);
+    bool ok = sdo_download(plan->targetNodeId, 0x1F5A, 1, status, sizeof(status));
+    xSemaphoreGive(sdoMutex);
+    return ok;
+}
+
+bool fw_master_query_slave_crc(const fw_upload_plan_t *plan, uint16_t *slaveCrc) {
+    uint8_t buf[2] = {0};
+    size_t got = 0;
+    if (sdoMutex == NULL) sdoMutex = xSemaphoreCreateMutex();
+    if (sdoMutex == NULL) return false;
+    xSemaphoreTake(sdoMutex, portMAX_DELAY);
+    bool ok = sdo_upload(plan->targetNodeId, 0x1F5B, 1, buf, sizeof(buf), &got);
+    xSemaphoreGive(sdoMutex);
+    if (!ok || got < 2) return false;
+    *slaveCrc = (uint16_t)(buf[0] | (buf[1] << 8));
+    return true;
+}
+
+bool fw_master_query_slave_version(const fw_upload_plan_t *plan, uint16_t *slaveVersion) {
+    uint8_t buf[2] = {0};
+    size_t got = 0;
+    if (sdoMutex == NULL) sdoMutex = xSemaphoreCreateMutex();
+    if (sdoMutex == NULL) return false;
+    xSemaphoreTake(sdoMutex, portMAX_DELAY);
+    bool ok = sdo_upload(plan->targetNodeId, 0x1F5C, 1, buf, sizeof(buf), &got);
+    xSemaphoreGive(sdoMutex);
+    if (!ok || got < 2) return false;
+    *slaveVersion = (uint16_t)(buf[0] | (buf[1] << 8));
+    return true;
+}
+
+static void fw_upload_task(void *arg) {
+    fw_upload_args_t *args = (fw_upload_args_t *)arg;
+    uint8_t nodeId = args->nodeId;
+    vPortFree(arg);  // Liberar args inmediatamente, ya tenemos nodeId
+    
+    // Esperar un momento para asegurar que CANopen esté totalmente operativo
+    vTaskDelay(pdMS_TO_TICKS(500));
+    
+    // Verificar que SDO client esté disponible
+    if (g_sdoClient == NULL) {
+        ESP_LOGE(TAG, "Upload abortado: SDO client no disponible para nodo %u", nodeId);
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    fw_upload_plan_t plan = {
+        .firmwarePath = FW_IMAGE_PATH,
+        .type = FW_IMAGE_MAIN,
+        .targetBank = FW_TARGET_BANK,
+        .targetNodeId = nodeId,
+        .maxChunkBytes = FW_MAX_CHUNK,
+        .expectedCrc = 0,
+        .firmwareVersion = FW_VERSION,
+    };
+
+    ESP_LOGI(TAG, "Iniciando uploader para nodo %u", nodeId);
+    
+    // Ejecutar una sola vez: subir si hace falta y salir para no seguir chequeando.
+    if (!fw_master_run_upload_if_needed(&plan)) {
+        ESP_LOGW(TAG, "Upload falló o no se completó para nodo %u", nodeId);
+    } else {
+        ESP_LOGI(TAG, "Nodo %u tiene firmware actualizado (CRC match)", nodeId);
+    }
+
+    // No reintentar continuamente: finalizar la tarea.
+    vTaskDelete(NULL);
+}
+
+static void start_firmware_upload(uint8_t nodeId) {
+    if (sdoMutex == NULL) {
+        sdoMutex = xSemaphoreCreateMutex();
+    }
+    fw_upload_args_t *args = pvPortMalloc(sizeof(fw_upload_args_t));
+    if (args == NULL) {
+        ESP_LOGW(TAG, "Sin memoria para tarea uploader (node %u)", nodeId);
+        return;
+    }
+    args->nodeId = nodeId;
+    xTaskCreatePinnedToCore(fw_upload_task, "fw_upload", 6144, args, 4, NULL, 1);
+}
 
 
 // Callback de Emergencia
@@ -138,6 +443,7 @@ static void CO_mainTask(void *pxParam) {
 
     while (reset != CO_RESET_APP) {
         ESP_LOGI(TAG, "Iniciando MASTER...");
+        g_sdoClient = NULL;  // Resetear al reiniciar
         CO->CANmodule->CANnormal = false;
         CO_CANsetConfigurationMode(CANptr);
 
@@ -158,8 +464,16 @@ static void CO_mainTask(void *pxParam) {
 
 
         uint32_t errInfo = 0;
-        CO_CANopenInit(CO, NULL, NULL, OD, NULL, NMT_CONTROL, 1000, 1000, 1000, false, MASTER_NODE_ID, &errInfo);
+        CO_CANopenInit(CO, NULL, NULL, OD, NULL, NMT_CONTROL, 1000, 1000, 3000, true, MASTER_NODE_ID, &errInfo);
         CO_CANopenInitPDO(CO, CO->em, OD, MASTER_NODE_ID, &errInfo);
+        
+        // Obtener y verificar SDO client reference (como en demo firmware_updater)
+        g_sdoClient = CO->SDOclient;
+        if (g_sdoClient == NULL) {
+            ESP_LOGE(TAG, "SDO client no disponible tras CO_CANopenInit");
+        } else {
+            ESP_LOGI(TAG, "SDO client inicializado correctamente");
+        }
 
 
         // Configurar SYNC (1 segundo)
@@ -290,14 +604,12 @@ static void CO_mainTask(void *pxParam) {
 
                             /* Si ya configuramos este nodo anteriormente, lo saltamos con expiración */
                             bool already = false;
-                            bool skip_active = false;
                             uint64_t now_check = esp_timer_get_time();
                             int matched_index = -1;
                             for (int ci = 0; ci < configured_nodes_count; ci++) {
                                 if (CO_LSS_ADDRESS_EQUAL(configured_nodes[ci].addr, last_found_address)) {
                                     already = true;
                                     matched_index = ci;
-                                    if (configured_nodes[ci].skip_until_us > now_check) skip_active = true;
                                     break;
                                 }
                             }
@@ -376,17 +688,30 @@ static void CO_mainTask(void *pxParam) {
                             CO_LSSmaster_swStateDeselect(CO->LSSmaster);
 
 
-                            /* Añadimos la dirección a la lista de configurados para evitar volver a tocarla */
-                            if (configured_nodes_count < MAX_CONFIGURED_NODES) {
+                            /* Añadimos la dirección a la lista de configurados SOLO si no existe ya */
+                            bool already_in_list = false;
+                            for (int ci = 0; ci < configured_nodes_count; ci++) {
+                                if (CO_LSS_ADDRESS_EQUAL(configured_nodes[ci].addr, last_found_address)) {
+                                    already_in_list = true;
+                                    ESP_LOGD(TAG, "Nodo ya en lista, no se agrega duplicado");
+                                    break;
+                                }
+                            }
+                            
+                            if (!already_in_list && configured_nodes_count < MAX_CONFIGURED_NODES) {
                                 configured_nodes[configured_nodes_count].addr = last_found_address;
                                 configured_nodes[configured_nodes_count].assigned_node_id = current_candidate_id;
                                 configured_nodes[configured_nodes_count].skip_until_us = esp_timer_get_time() + (uint64_t)CONFIGURED_NODE_SKIP_MS * 1000ULL;
+                                configured_nodes[configured_nodes_count].upload_launched = false;  // Inicializar flag de upload
                                 configured_nodes_count++;
                                 ESP_LOGI(TAG, "Guardado nodo configurado (serial ...%08" PRIX32 ") en lista (count=%d)", (uint32_t)last_found_address.addr[3], configured_nodes_count);
+                            } else if (already_in_list) {
+                                ESP_LOGD(TAG, "Nodo ya configurado previamente, skip");
                             } else {
                                 ESP_LOGW(TAG, "Lista de nodos configurados llena, no se almacenó la dirección");
                             }
 
+                            /* El uploader se lanzará después, cuando la red esté operativa en LSS_DONE */
 
                             /* Preparar siguiente candidato y esperar un breve tiempo no bloqueante */
                             next_id_to_assign = (current_candidate_id < 127) ? (uint8_t)(current_candidate_id + 1) : 2;
@@ -491,7 +816,77 @@ static void CO_mainTask(void *pxParam) {
                 case LSS_DONE:
                     // Operativo: envía NMT Start All periódicamente y vuelve a escanear cada RESCAN_INTERVAL_MS
                     static int nmt_timer = 0;
+                    static uint64_t last_active_scan_us = 0;
                     uint64_t now_us = esp_timer_get_time();
+                    const uint64_t ACTIVE_SCAN_INTERVAL_US = 30000000ULL; // 30 s (menos frecuente para no bloquear)
+                    const uint8_t ACTIVE_SCAN_START_ID = ID_INICIO_ASIGNACION;
+                    const uint8_t ACTIVE_SCAN_END_ID = 0x20;
+
+                    // Escanear nodos activos en el bus cada intervalo, pero CON TIMEOUT CORTO para no bloquear
+                    if (now_us - last_active_scan_us > ACTIVE_SCAN_INTERVAL_US) {
+                        ESP_LOGI(TAG, "Escaneando nodos activos (IDs %u-%u) con timeout=100ms...", ACTIVE_SCAN_START_ID, ACTIVE_SCAN_END_ID);
+                        bool duplicate_found = false;
+
+                        for (uint8_t test_id = ACTIVE_SCAN_START_ID; test_id <= ACTIVE_SCAN_END_ID; test_id++) {
+                            if (test_id == MASTER_NODE_ID) continue;
+
+                            // Intenta tomar mutex con timeout corto (100ms) para no bloquear
+                            if (sdoMutex == NULL) sdoMutex = xSemaphoreCreateMutex();
+                            if (sdoMutex != NULL) {
+                                // Timeout de 100ms (no portMAX_DELAY)
+                                if (xSemaphoreTake(sdoMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                                    bool responds = sdo_probe_node(test_id);
+                                    xSemaphoreGive(sdoMutex);
+
+                                    if (responds) {
+                                        ESP_LOGI(TAG, "Nodo activo detectado: ID=%d", test_id);
+
+                                        // Buscar en lista de configurados
+                                        bool found = false;
+                                        for (int i = 0; i < configured_nodes_count; i++) {
+                                            if (configured_nodes[i].assigned_node_id == test_id) {
+                                                if (!configured_nodes[i].upload_launched) {
+                                                    ESP_LOGI(TAG, "Lanzando uploader para nodo ID=%d", test_id);
+                                                    start_firmware_upload(test_id);
+                                                    configured_nodes[i].upload_launched = true;
+                                                } else {
+                                                    // Ya teniamos uploader en este ID: posible duplicado en bus
+                                                    uint8_t next_free = find_next_free_node_id();
+                                                    ESP_LOGW(TAG, "Posible ID duplicado en el bus (ID=%d). Relanzando fast-scan para reasignar al siguiente libre=%u", test_id, next_free);
+                                                    next_id_to_assign = next_free;
+                                                    lssState = LSS_INIT;
+                                                    duplicate_found = true;
+                                                }
+                                                found = true;
+                                                break;
+                                            }
+                                        }
+
+                                        // Si no está en la lista, agregarlo y lanzar uploader
+                                        if (!found && configured_nodes_count < MAX_CONFIGURED_NODES) {
+                                            memset(&configured_nodes[configured_nodes_count].addr, 0, sizeof(CO_LSS_address_t));
+                                            configured_nodes[configured_nodes_count].assigned_node_id = test_id;
+                                            configured_nodes[configured_nodes_count].skip_until_us = 0;
+                                            configured_nodes[configured_nodes_count].upload_launched = true;
+                                            configured_nodes_count++;
+                                            ESP_LOGI(TAG, "Lanzando uploader para nodo activo ID=%d", test_id);
+                                            start_firmware_upload(test_id);
+                                        }
+
+                                        vTaskDelay(pdMS_TO_TICKS(20));
+                                    }
+                                } else {
+                                    // Timeout tomando mutex, saltar este nodo
+                                    ESP_LOGD(TAG, "ID=%d: mutex timeout, saltando.", test_id);
+                                }
+                            }
+                            if (duplicate_found) break;
+                        }
+
+                        last_active_scan_us = now_us;
+                        ESP_LOGI(TAG, "Escaneo activo completado. Nodos configurados: %d", configured_nodes_count);
+                    }
+
                     if (nmt_timer++ > (1000 / MAIN_INTERVAL_MS)) { // approx every 1s
                         ESP_LOGI(TAG, "Red Operativa. Enviando NMT Start All.");
                         CO_NMT_sendCommand(CO->NMT, CO_NMT_ENTER_OPERATIONAL, 0);
@@ -499,7 +894,7 @@ static void CO_mainTask(void *pxParam) {
                     }
                     if ((now_us - last_rescan_us_global) > (uint64_t)RESCAN_INTERVAL_MS * 1000ULL) {
                         last_rescan_us_global = now_us;
-                        ESP_LOGI(TAG, "Re-lanzando fast-scan para detectar nuevos nodos.");
+                        ESP_LOGD(TAG, "Re-lanzando fast-scan para detectar nuevos nodos.");
                         lssState = LSS_INIT;
                     }
                     break;
@@ -537,8 +932,10 @@ static void CO_periodicTask(void *pxParam) {
         #if (CO_CONFIG_SYNC) & CO_CONFIG_SYNC_ENABLE
         syncWas = CO_process_SYNC(CO, co_timer_us, NULL);
         #endif
+        #if MASTER_ENABLE_PDO
         CO_process_RPDO(CO, syncWas, co_timer_us, NULL);
         CO_process_TPDO(CO, syncWas, co_timer_us, NULL);
+        #endif
         #if (CO_CONFIG_HB_CONS) & CO_CONFIG_HB_CONS_ENABLE
         CO_HBconsumer_process(CO->HBcons, true, co_timer_us, NULL);
         #endif
