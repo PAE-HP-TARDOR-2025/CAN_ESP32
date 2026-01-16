@@ -163,7 +163,7 @@ static volatile bool s_force_lss_reassign = false;
 
 
 // Re-scan interval (ms) para preguntar por nodos nuevos conectados posteriormente
-#define RESCAN_INTERVAL_MS 10000
+#define RESCAN_INTERVAL_MS 5000
 // Tiempo que esperamos tras deseleccionar (ms) para que el esclavo haga reset/apply NID
 // Incrementado para dar más tiempo al esclavo a aplicar la configuración
 #define DESELECT_DELAY_MS 1000
@@ -911,10 +911,12 @@ static void CO_mainTask(void *pxParam) {
                     // Operativo: envía NMT Start All periódicamente y vuelve a escanear cada RESCAN_INTERVAL_MS
                     static int nmt_timer = 0;
                     static uint64_t last_active_scan_us = 0;
+                    static uint8_t next_active_probe_id = ID_INICIO_ASIGNACION;
                     uint64_t now_us = esp_timer_get_time();
-                    const uint64_t ACTIVE_SCAN_INTERVAL_US = 30000000ULL; // 30 s (menos frecuente para no bloquear)
+                    const uint64_t ACTIVE_SCAN_INTERVAL_US = 1000000ULL; // 1 s (más frecuente para detección)
                     const uint8_t ACTIVE_SCAN_START_ID = ID_INICIO_ASIGNACION;
-                    const uint8_t ACTIVE_SCAN_END_ID = 0x20;
+                    const uint8_t ACTIVE_SCAN_END_ID = 0x1F; // 16-31 (16 nodos)
+                    const int ACTIVE_SCAN_IDS_PER_CYCLE = (int)(ACTIVE_SCAN_END_ID - ACTIVE_SCAN_START_ID + 1);
 
                     if (s_force_lss_reassign && s_activeUploads == 0) {
                         ESP_LOGW(TAG, "Reasignación LSS solicitada. Forzando modo configuración.");
@@ -929,76 +931,102 @@ static void CO_mainTask(void *pxParam) {
                             last_active_scan_us = now_us;
                             break;
                         }
-                        ESP_LOGI(TAG, "Escaneando nodos activos (IDs %u-%u) con timeout=100ms...", ACTIVE_SCAN_START_ID, ACTIVE_SCAN_END_ID);
-                        bool duplicate_found = false;
+                        if (next_active_probe_id < ACTIVE_SCAN_START_ID || next_active_probe_id > ACTIVE_SCAN_END_ID) {
+                            next_active_probe_id = ACTIVE_SCAN_START_ID;
+                        }
 
-                        for (uint8_t test_id = ACTIVE_SCAN_START_ID; test_id <= ACTIVE_SCAN_END_ID; test_id++) {
-                            if (test_id == MASTER_NODE_ID) continue;
+                        for (int scan_i = 0; scan_i < ACTIVE_SCAN_IDS_PER_CYCLE; scan_i++) {
+                            uint8_t test_id = next_active_probe_id;
+                            if (test_id == MASTER_NODE_ID) {
+                                test_id = (test_id < ACTIVE_SCAN_END_ID) ? (uint8_t)(test_id + 1) : ACTIVE_SCAN_START_ID;
+                            }
 
-                            // Intenta tomar mutex con timeout corto (100ms) para no bloquear
+                            ESP_LOGI(TAG, "Consultando nodo ID=%u (rango %u-%u)...", test_id, ACTIVE_SCAN_START_ID, ACTIVE_SCAN_END_ID);
+                            bool responds = false;
+
                             if (sdoMutex == NULL) sdoMutex = xSemaphoreCreateMutex();
                             if (sdoMutex != NULL) {
-                                // Timeout de 100ms (no portMAX_DELAY)
                                 if (xSemaphoreTake(sdoMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                                    bool responds = sdo_probe_node(test_id);
-                                    xSemaphoreGive(sdoMutex);
-
-                                    if (responds) {
-                                        ESP_LOGI(TAG, "Nodo activo detectado: ID=%d", test_id);
-
-                                        // Buscar en lista de configurados
-                                        bool found = false;
-                                        for (int i = 0; i < configured_nodes_count; i++) {
-                                            if (configured_nodes[i].assigned_node_id == test_id) {
-                                                if (!configured_nodes[i].upload_launched) {
-                                                    ESP_LOGI(TAG, "Lanzando uploader para nodo ID=%d", test_id);
-                                                    if (start_firmware_upload(test_id)) {
-                                                        configured_nodes[i].upload_launched = true;
-                                                    }
-                                                } else {
-                                                    ESP_LOGD(TAG, "Uploader ya lanzado para ID=%d; verificando duplicados", test_id);
-                                                    /* Sospecha de ID duplicada: relanzar fast-scan para reasignar un ID libre */
-                                                    uint64_t now_dup = esp_timer_get_time();
-                                                    if ((now_dup - s_lastDuplicateScan_us) > 5000000ULL) { /* 5s cooldown */
-                                                        uint8_t next_free = find_next_free_node_id();
-                                                        ESP_LOGW(TAG, "Posible ID duplicado en el bus (ID=%d). Relanzando fast-scan para reasignar al siguiente libre=%u", test_id, next_free);
-                                                        next_id_to_assign = next_free;
-                                                        lssState = LSS_INIT;
-                                                        duplicate_found = true;
-                                                        s_lastDuplicateScan_us = now_dup;
-                                                    }
-                                                }
-                                                found = true;
-                                                break;
-                                            }
+                                    for (int attempt = 0; attempt < 3 && !responds; attempt++) {
+                                        responds = sdo_probe_node(test_id);
+                                        if (!responds) {
+                                            vTaskDelay(pdMS_TO_TICKS(10));
                                         }
-
-                                        // Si no está en la lista, agregarlo y lanzar uploader
-                                        if (!found && configured_nodes_count < MAX_CONFIGURED_NODES) {
-                                            memset(&configured_nodes[configured_nodes_count].addr, 0, sizeof(CO_LSS_address_t));
-                                            configured_nodes[configured_nodes_count].assigned_node_id = test_id;
-                                            configured_nodes[configured_nodes_count].skip_until_us = 0;
-                                            configured_nodes[configured_nodes_count].upload_launched = false;
-                                            configured_nodes_count++;
-                                            ESP_LOGI(TAG, "Lanzando uploader para nodo activo ID=%d", test_id);
-                                            if (start_firmware_upload(test_id)) {
-                                                configured_nodes[configured_nodes_count - 1].upload_launched = true;
-                                            }
-                                        }
-
-                                        vTaskDelay(pdMS_TO_TICKS(20));
                                     }
+                                    xSemaphoreGive(sdoMutex);
                                 } else {
-                                    // Timeout tomando mutex, saltar este nodo
-                                    ESP_LOGD(TAG, "ID=%d: mutex timeout, saltando.", test_id);
+                                    ESP_LOGD(TAG, "ID=%u: mutex timeout, saltando.", test_id);
                                 }
                             }
-                            vTaskDelay(pdMS_TO_TICKS(1));
-                            if (duplicate_found) break;
+
+                            if (responds) {
+                                fw_upload_plan_t plan = {
+                                    .firmwarePath = FW_IMAGE_PATH,
+                                    .type = FW_IMAGE_MAIN,
+                                    .targetBank = FW_TARGET_BANK,
+                                    .targetNodeId = test_id,
+                                    .maxChunkBytes = FW_MAX_CHUNK,
+                                    .expectedCrc = 0,
+                                    .firmwareVersion = FW_VERSION,
+                                };
+
+                                uint16_t crc = 0;
+                                uint16_t ver = 0;
+                                bool got_crc = false;
+                                bool got_ver = false;
+                                for (int q = 0; q < 2 && (!got_crc || !got_ver); q++) {
+                                    if (!got_crc) got_crc = fw_master_query_slave_crc(&plan, &crc);
+                                    if (!got_ver) got_ver = fw_master_query_slave_version(&plan, &ver);
+                                    if ((!got_crc || !got_ver)) {
+                                        vTaskDelay(pdMS_TO_TICKS(10));
+                                    }
+                                }
+
+                                if (got_crc && got_ver) {
+                                    ESP_LOGI(TAG, "Nodo activo ID=%u: CRC=0x%04X, ver=%u", test_id, crc, ver);
+                                } else if (got_crc) {
+                                    ESP_LOGW(TAG, "Nodo activo ID=%u: CRC=0x%04X, ver=??", test_id, crc);
+                                } else if (got_ver) {
+                                    ESP_LOGW(TAG, "Nodo activo ID=%u: CRC=??, ver=%u", test_id, ver);
+                                } else {
+                                    ESP_LOGW(TAG, "Nodo activo ID=%u: no se pudo leer CRC/versión", test_id);
+                                }
+
+                                bool found = false;
+                                for (int i = 0; i < configured_nodes_count; i++) {
+                                    if (configured_nodes[i].assigned_node_id == test_id) {
+                                        found = true;
+                                        if (got_ver && ver != FW_VERSION && !configured_nodes[i].upload_launched) {
+                                            ESP_LOGW(TAG, "Nodo ID=%u con ver=%u (esperado %u). Lanzando update.", test_id, ver, FW_VERSION);
+                                            if (start_firmware_upload(test_id)) {
+                                                configured_nodes[i].upload_launched = true;
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+
+                                if (!found && configured_nodes_count < MAX_CONFIGURED_NODES) {
+                                    memset(&configured_nodes[configured_nodes_count].addr, 0, sizeof(CO_LSS_address_t));
+                                    configured_nodes[configured_nodes_count].assigned_node_id = test_id;
+                                    configured_nodes[configured_nodes_count].skip_until_us = 0;
+                                    configured_nodes[configured_nodes_count].upload_launched = false;
+                                    configured_nodes_count++;
+                                    if (got_ver && ver != FW_VERSION) {
+                                        ESP_LOGW(TAG, "Nodo ID=%u con ver=%u (esperado %u). Lanzando update.", test_id, ver, FW_VERSION);
+                                        if (start_firmware_upload(test_id)) {
+                                            configured_nodes[configured_nodes_count - 1].upload_launched = true;
+                                        }
+                                    }
+                                }
+                            } else {
+                                ESP_LOGI(TAG, "Sin respuesta de ID=%u, pasando al siguiente.", test_id);
+                            }
+
+                            next_active_probe_id = (test_id < ACTIVE_SCAN_END_ID) ? (uint8_t)(test_id + 1) : ACTIVE_SCAN_START_ID;
                         }
 
                         last_active_scan_us = now_us;
-                        ESP_LOGI(TAG, "Escaneo activo completado. Nodos configurados: %d", configured_nodes_count);
                     }
 
                     if (nmt_timer++ > (1000 / MAIN_INTERVAL_MS)) { // approx every 1s
