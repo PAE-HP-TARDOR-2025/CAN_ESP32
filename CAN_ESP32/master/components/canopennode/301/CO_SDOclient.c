@@ -1095,7 +1095,6 @@ CO_SDOclientUpload(CO_SDOclient_t* SDO_C, uint32_t timeDifference_us, bool_t sen
         abortCode = CO_SDO_AB_DEVICE_INCOMPAT;
         ret = CO_SDO_RT_wrongArguments;
     } else if (SDO_C->state == CO_SDO_ST_IDLE) {
-        ret = CO_SDO_RT_ok_communicationEnd;
     }
 #if ((CO_CONFIG_SDO_CLI)&CO_CONFIG_SDO_CLI_LOCAL) != 0
     /* Transfer data locally */

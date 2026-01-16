@@ -4,6 +4,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 #ifndef FW_MASTER_LOG
 #define FW_MASTER_LOG(fmt, ...) printf("[FW-MASTER] " fmt, ##__VA_ARGS__)
 #endif
@@ -146,6 +149,7 @@ static bool fw_master_stream_file(const fw_upload_plan_t* plan, size_t fileSize)
             break;
         }
         offset += n;
+        vTaskDelay(pdMS_TO_TICKS(1));
         if (offset >= next_log || offset == fileSize) {
             FW_MASTER_LOG("Progress: %zu/%zu bytes (%.1f%%)\n", offset, fileSize,
                           (fileSize > 0) ? (100.0 * (double)offset / (double)fileSize) : 0.0);

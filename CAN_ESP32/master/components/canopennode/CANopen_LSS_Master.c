@@ -48,6 +48,7 @@ typedef enum {
     LSS_VERIFY_ID, /* verify node ID after store */
     LSS_DESELECT, /* deselect node after store */
     LSS_ACTIVATE,
+    LSS_FORCE_SELECT,
     LSS_DONE
 } LssState_t;
 
@@ -66,6 +67,9 @@ static uint8_t next_id_to_assign = ID_INICIO_ASIGNACION;
 static uint64_t scan_start_us = 0;
 static uint32_t cached_vendor = 0;
 static uint32_t cached_product = 0;
+
+/* SDO client reference. */
+static CO_SDOclient_t *g_sdoClient = NULL;
 
 
 // Lista simple de nodos ya configurados en runtime para evitar reconfigurar el mismo serial
@@ -105,6 +109,41 @@ static uint8_t find_next_free_node_id(void) {
     }
 }
 
+/* Probe mínimo para saber si un nodo con ID responde por SDO sin generar logs de error. */
+static bool sdo_probe_node(uint8_t nodeId);
+
+static bool is_node_id_used(uint8_t candidate) {
+    if (candidate == MASTER_NODE_ID) {
+        return true;
+    }
+    for (int i = 0; i < configured_nodes_count; i++) {
+        if (configured_nodes[i].assigned_node_id == candidate) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool is_node_id_active_on_bus(uint8_t candidate) {
+    if (candidate == MASTER_NODE_ID) {
+        return true;
+    }
+    if (g_sdoClient == NULL) {
+        return false;
+    }
+    return sdo_probe_node(candidate);
+}
+
+static uint8_t find_next_free_node_id_active_aware(void) {
+    uint8_t candidate = ID_INICIO_ASIGNACION;
+    while (true) {
+        if (!is_node_id_used(candidate) && !is_node_id_active_on_bus(candidate)) {
+            return candidate;
+        }
+        candidate = (candidate < 127) ? (uint8_t)(candidate + 1) : 2;
+    }
+}
+
 /* Firmware update plan */
 #define FW_IMAGE_PATH   "/spiffs/slave.bin"
 #define FW_TARGET_BANK  1
@@ -116,6 +155,11 @@ typedef struct {
 } fw_upload_args_t;
 
 static SemaphoreHandle_t sdoMutex = NULL;
+
+static TaskHandle_t s_fwUploadTasks[128] = {0};
+static volatile int s_activeUploads = 0;
+static uint64_t s_lastDuplicateScan_us = 0;
+static volatile bool s_force_lss_reassign = false;
 
 
 // Re-scan interval (ms) para preguntar por nodos nuevos conectados posteriormente
@@ -142,7 +186,6 @@ TaskHandle_t mainTaskHandle = NULL;
 TaskHandle_t periodicTaskHandle = NULL;
 
 /* SDO client reference (como en el demo de firmware_updater) */
-static CO_SDOclient_t *g_sdoClient = NULL;
 
 static void CO_mainTask(void *pxParam);
 #if (((CO_CONFIG_LSS)&CO_CONFIG_FLAG_CALLBACK_PRE) != 0)
@@ -398,25 +441,56 @@ static void fw_upload_task(void *arg) {
     // Ejecutar una sola vez: subir si hace falta y salir para no seguir chequeando.
     if (!fw_master_run_upload_if_needed(&plan)) {
         ESP_LOGW(TAG, "Upload falló o no se completó para nodo %u", nodeId);
+        s_force_lss_reassign = true;
     } else {
         ESP_LOGI(TAG, "Nodo %u tiene firmware actualizado (CRC match)", nodeId);
     }
 
     // No reintentar continuamente: finalizar la tarea.
+    if (nodeId < 128) {
+        s_fwUploadTasks[nodeId] = NULL;
+    }
+    if (s_activeUploads > 0) {
+        s_activeUploads--;
+    }
     vTaskDelete(NULL);
 }
 
-static void start_firmware_upload(uint8_t nodeId) {
+static bool start_firmware_upload(uint8_t nodeId) {
     if (sdoMutex == NULL) {
         sdoMutex = xSemaphoreCreateMutex();
     }
+
+    if (nodeId < 128 && s_fwUploadTasks[nodeId] != NULL) {
+        ESP_LOGI(TAG, "Uploader ya en ejecución para nodo %u; saltando", nodeId);
+        return false;
+    }
+
+    if (s_activeUploads > 0) {
+        ESP_LOGI(TAG, "Uploader activo (%d). Esperando para nodo %u", s_activeUploads, nodeId);
+        return false;
+    }
+
     fw_upload_args_t *args = pvPortMalloc(sizeof(fw_upload_args_t));
     if (args == NULL) {
         ESP_LOGW(TAG, "Sin memoria para tarea uploader (node %u)", nodeId);
-        return;
+        return false;
     }
     args->nodeId = nodeId;
-    xTaskCreatePinnedToCore(fw_upload_task, "fw_upload", 6144, args, 4, NULL, 1);
+
+    TaskHandle_t handle = NULL;
+    BaseType_t created = xTaskCreatePinnedToCore(fw_upload_task, "fw_upload", 8192, args, 4, &handle, 1);
+    if (created != pdPASS) {
+        ESP_LOGW(TAG, "No se pudo crear tarea uploader (node %u)", nodeId);
+        vPortFree(args);
+        return false;
+    }
+
+    if (nodeId < 128) {
+        s_fwUploadTasks[nodeId] = handle;
+    }
+    s_activeUploads++;
+    return true;
 }
 
 
@@ -645,6 +719,13 @@ static void CO_mainTask(void *pxParam) {
                             log_config_id = true;
                         }
 
+                        if (is_node_id_used(current_candidate_id) || is_node_id_active_on_bus(current_candidate_id)) {
+                            uint8_t next_free = find_next_free_node_id_active_aware();
+                            ESP_LOGW(TAG, "ID %d ocupada en bus. Probando siguiente libre=%u", current_candidate_id, next_free);
+                            current_candidate_id = next_free;
+                            log_config_id = false;
+                        }
+
 
                         CO_LSSmaster_return_t idret = CO_LSSmaster_configureNodeId(CO->LSSmaster, co_timer_us, current_candidate_id);
 
@@ -657,8 +738,7 @@ static void CO_mainTask(void *pxParam) {
                             /* ID no válida o ocupada: intentar siguiente ID (no bloqueamos aquí) */
                             ESP_LOGW(TAG, "LSS: ID %d no válida/ocupada. Probando siguiente...", current_candidate_id);
                             /* avanzar candidato y evitar usar la ID del master */
-                            current_candidate_id = (current_candidate_id < 127) ? (uint8_t)(current_candidate_id + 1) : 2;
-                            if (current_candidate_id == MASTER_NODE_ID) current_candidate_id++;
+                            current_candidate_id = find_next_free_node_id_active_aware();
                             if (++id_attempt_rounds > 126) {
                                 ESP_LOGW(TAG, "LSS: No se encontró ID libre tras muchos intentos. Abortando asignación.");
                                 lssState = LSS_DONE;
@@ -714,8 +794,7 @@ static void CO_mainTask(void *pxParam) {
                             /* El uploader se lanzará después, cuando la red esté operativa en LSS_DONE */
 
                             /* Preparar siguiente candidato y esperar un breve tiempo no bloqueante */
-                            next_id_to_assign = (current_candidate_id < 127) ? (uint8_t)(current_candidate_id + 1) : 2;
-                            if (next_id_to_assign == MASTER_NODE_ID) next_id_to_assign++;
+                            next_id_to_assign = find_next_free_node_id_active_aware();
                             current_candidate_id = next_id_to_assign;
                             id_attempt_rounds = 0;
                             selection_verify_attempts = 0;
@@ -812,6 +891,21 @@ static void CO_mainTask(void *pxParam) {
                     }
                     break;
 
+                case LSS_FORCE_SELECT:
+                    {
+                        CO_LSSmaster_return_t sret = CO_LSSmaster_swStateSelect(CO->LSSmaster, co_timer_us, NULL);
+                        if (sret == CO_LSSmaster_OK) {
+                            ESP_LOGW(TAG, "Forzando LSS global: re-asignando IDs por duplicados");
+                            s_force_lss_reassign = false;
+                            lssState = LSS_INIT;
+                        } else if (sret == CO_LSSmaster_WAIT_SLAVE) {
+                            vTaskDelay(pdMS_TO_TICKS(10));
+                        } else {
+                            ESP_LOGW(TAG, "LSS global select falló (%d). Reintentando...", sret);
+                        }
+                    }
+                    break;
+
 
                 case LSS_DONE:
                     // Operativo: envía NMT Start All periódicamente y vuelve a escanear cada RESCAN_INTERVAL_MS
@@ -822,8 +916,19 @@ static void CO_mainTask(void *pxParam) {
                     const uint8_t ACTIVE_SCAN_START_ID = ID_INICIO_ASIGNACION;
                     const uint8_t ACTIVE_SCAN_END_ID = 0x20;
 
+                    if (s_force_lss_reassign && s_activeUploads == 0) {
+                        ESP_LOGW(TAG, "Reasignación LSS solicitada. Forzando modo configuración.");
+                        lssState = LSS_FORCE_SELECT;
+                        break;
+                    }
+
                     // Escanear nodos activos en el bus cada intervalo, pero CON TIMEOUT CORTO para no bloquear
                     if (now_us - last_active_scan_us > ACTIVE_SCAN_INTERVAL_US) {
+                        if (s_activeUploads > 0) {
+                            ESP_LOGD(TAG, "Uploads activos (%d); posponiendo escaneo de nodos activos", s_activeUploads);
+                            last_active_scan_us = now_us;
+                            break;
+                        }
                         ESP_LOGI(TAG, "Escaneando nodos activos (IDs %u-%u) con timeout=100ms...", ACTIVE_SCAN_START_ID, ACTIVE_SCAN_END_ID);
                         bool duplicate_found = false;
 
@@ -847,15 +952,21 @@ static void CO_mainTask(void *pxParam) {
                                             if (configured_nodes[i].assigned_node_id == test_id) {
                                                 if (!configured_nodes[i].upload_launched) {
                                                     ESP_LOGI(TAG, "Lanzando uploader para nodo ID=%d", test_id);
-                                                    start_firmware_upload(test_id);
-                                                    configured_nodes[i].upload_launched = true;
+                                                    if (start_firmware_upload(test_id)) {
+                                                        configured_nodes[i].upload_launched = true;
+                                                    }
                                                 } else {
-                                                    // Ya teniamos uploader en este ID: posible duplicado en bus
-                                                    uint8_t next_free = find_next_free_node_id();
-                                                    ESP_LOGW(TAG, "Posible ID duplicado en el bus (ID=%d). Relanzando fast-scan para reasignar al siguiente libre=%u", test_id, next_free);
-                                                    next_id_to_assign = next_free;
-                                                    lssState = LSS_INIT;
-                                                    duplicate_found = true;
+                                                    ESP_LOGD(TAG, "Uploader ya lanzado para ID=%d; verificando duplicados", test_id);
+                                                    /* Sospecha de ID duplicada: relanzar fast-scan para reasignar un ID libre */
+                                                    uint64_t now_dup = esp_timer_get_time();
+                                                    if ((now_dup - s_lastDuplicateScan_us) > 5000000ULL) { /* 5s cooldown */
+                                                        uint8_t next_free = find_next_free_node_id();
+                                                        ESP_LOGW(TAG, "Posible ID duplicado en el bus (ID=%d). Relanzando fast-scan para reasignar al siguiente libre=%u", test_id, next_free);
+                                                        next_id_to_assign = next_free;
+                                                        lssState = LSS_INIT;
+                                                        duplicate_found = true;
+                                                        s_lastDuplicateScan_us = now_dup;
+                                                    }
                                                 }
                                                 found = true;
                                                 break;
@@ -867,10 +978,12 @@ static void CO_mainTask(void *pxParam) {
                                             memset(&configured_nodes[configured_nodes_count].addr, 0, sizeof(CO_LSS_address_t));
                                             configured_nodes[configured_nodes_count].assigned_node_id = test_id;
                                             configured_nodes[configured_nodes_count].skip_until_us = 0;
-                                            configured_nodes[configured_nodes_count].upload_launched = true;
+                                            configured_nodes[configured_nodes_count].upload_launched = false;
                                             configured_nodes_count++;
                                             ESP_LOGI(TAG, "Lanzando uploader para nodo activo ID=%d", test_id);
-                                            start_firmware_upload(test_id);
+                                            if (start_firmware_upload(test_id)) {
+                                                configured_nodes[configured_nodes_count - 1].upload_launched = true;
+                                            }
                                         }
 
                                         vTaskDelay(pdMS_TO_TICKS(20));
@@ -880,6 +993,7 @@ static void CO_mainTask(void *pxParam) {
                                     ESP_LOGD(TAG, "ID=%d: mutex timeout, saltando.", test_id);
                                 }
                             }
+                            vTaskDelay(pdMS_TO_TICKS(1));
                             if (duplicate_found) break;
                         }
 
