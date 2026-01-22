@@ -1,4 +1,4 @@
-# CAN_ESP32
+# Master + firmware
 
 # Como hacer build
 1. Instalamos esp-idf (para poder visualizarlo lo instalamos en vscode)
